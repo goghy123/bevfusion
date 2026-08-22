@@ -17,11 +17,11 @@ load_from: null
 resume_from: null
 
 cudnn_benchmark: false
-fp16:
-  loss_scale: 
-    growth_interval: 2000
+fp16: null
+  # loss_scale: 
+  #   growth_interval: 2000
 
-max_epochs: 2
+max_epochs: 10
 runner:
   type: CustomEpochBasedRunner
   max_epochs: ${max_epochs}
