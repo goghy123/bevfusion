@@ -55,7 +55,7 @@ class LoadMultiViewImageFromFiles:
         images = []
         h, w = 0, 0
         for name in filename:
-            images.append(Image.open(name))
+            images.append(Image.open(name).convert("RGB"))
         
         #TODO: consider image padding in waymo
 
