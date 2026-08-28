@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from mmcv.runner import auto_fp16
 from torch import nn as nn
+from torch.nn import functional as F
 
 from mmdet3d.ops import SparseBasicBlock, make_sparse_convmodule
 from mmdet3d.ops import spconv as spconv
@@ -42,6 +43,7 @@ class SparseEncoder(nn.Module):
         encoder_channels=((16,), (32, 32, 32), (64, 64, 64), (64, 64, 64)),
         encoder_paddings=((1,), (1, 1, 1), (1, 1, 1), ((0, 1, 1), 1, 1)),
         block_type="conv_module",
+        vertical_pool_size=None,
     ):
         super().__init__()
         assert block_type in ["conv_module", "basicblock"]
@@ -50,6 +52,14 @@ class SparseEncoder(nn.Module):
         self.order = order
         self.base_channels = base_channels
         self.output_channels = output_channels
+        self.vertical_pool_size = vertical_pool_size
+
+        if self.vertical_pool_size is not None:
+            if not isinstance(self.vertical_pool_size, int):
+                raise TypeError("vertical_pool_size must be int or None")
+            if self.vertical_pool_size <= 0:
+                raise ValueError("vertical_pool_size must be > 0")
+
         self.encoder_channels = encoder_channels
         self.encoder_paddings = encoder_paddings
         self.stage_num = len(self.encoder_channels)
@@ -126,8 +136,33 @@ class SparseEncoder(nn.Module):
         spatial_features = out.dense()
 
         N, C, H, W, D = spatial_features.shape
-        spatial_features = spatial_features.permute(0, 1, 4, 2, 3).contiguous()
-        spatial_features = spatial_features.view(N, C * D, H, W)
+
+        # [N, C, H, W, D] -> [N, C, D, H, W]
+        spatial_features = spatial_features.permute(
+            0, 1, 4, 2, 3
+        ).contiguous()
+
+        if self.vertical_pool_size is not None:
+            current_d = spatial_features.shape[2]
+
+            if current_d != self.vertical_pool_size:
+                spatial_features = F.adaptive_max_pool3d(
+                    spatial_features,
+                    output_size=(
+                        self.vertical_pool_size,
+                        spatial_features.shape[3],
+                        spatial_features.shape[4],
+                    ),
+                )
+
+        D = spatial_features.shape[2]
+
+        spatial_features = spatial_features.view(
+            N,
+            C * D,
+            spatial_features.shape[3],
+            spatial_features.shape[4],
+        )
 
         return spatial_features
 

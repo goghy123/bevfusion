@@ -36,8 +36,9 @@ model:
       backbone:
         type: SparseEncoder
         in_channels: 5
-        sparse_shape: [1024, 1024, 53]
+        sparse_shape: [1024, 1024, 131]
         output_channels: 128
+        vertical_pool_size: 2
         order:
           - conv
           - norm

@@ -17,7 +17,7 @@ model:
       train_cfg:
         dataset: UAVDataset
         point_cloud_range: ${point_cloud_range}
-        grid_size: [1024, 1024, 53]
+        grid_size: [1024, 1024, 131]
         voxel_size: ${voxel_size}
         out_size_factor: 8
         gaussian_overlap: 0.1
@@ -42,7 +42,7 @@ model:
             weight: 0.25
       test_cfg:
         dataset: UAVDataset
-        grid_size: [1024, 1024, 53]
+        grid_size: [1024, 1024, 131]
         out_size_factor: 8
         voxel_size: ${voxel_size[:2]}
         pc_range: ${point_cloud_range[:2]}
