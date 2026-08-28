@@ -5,8 +5,8 @@ load_dim: 5
 use_dim: 5
 max_sweeps: 9
 
-point_cloud_range: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
-voxel_size: [0.1, 0.1, 0.2]
+point_cloud_range: [-51.2, -51.2, -12.0, 51.2, 51.2, 14.0]
+voxel_size: [0.1, 0.1, 0.5]
 image_size: [320, 576]
 
 augment2d:
@@ -21,6 +21,18 @@ augment3d:
   scale: [0.95, 1.05]
   rotate: [-0.78539816, 0.78539816]
   translate: 0.5
+
+
+frustum_filter:
+  # Geometry is computed from lidar2image + actual image size.
+  # These are safety/quality thresholds, not FOV constants.
+  min_depth: 0.05
+  max_depth: null
+  margin_px: 2.0
+  min_points: 1000
+  min_keep_ratio: 0.005
+  mode: union
+  on_threshold_failure: raise
 
 object_classes:
   - car
@@ -51,6 +63,15 @@ train_pipeline:
     use_dim: ${use_dim}
     pad_empty_sweeps: false
     remove_close: false
+  -
+    type: LiDARCameraFrustumFilter
+    min_depth: ${frustum_filter.min_depth}
+    max_depth: ${frustum_filter.max_depth}
+    margin_px: ${frustum_filter.margin_px}
+    min_points: ${frustum_filter.min_points}
+    min_keep_ratio: ${frustum_filter.min_keep_ratio}
+    mode: ${frustum_filter.mode}
+    on_threshold_failure: ${frustum_filter.on_threshold_failure}
   -
     type: LoadAnnotations3D
     with_bbox_3d: true
@@ -136,6 +157,15 @@ test_pipeline:
     pad_empty_sweeps: false
     remove_close: false
     test_mode: true
+  -
+    type: LiDARCameraFrustumFilter
+    min_depth: ${frustum_filter.min_depth}
+    max_depth: ${frustum_filter.max_depth}
+    margin_px: ${frustum_filter.margin_px}
+    min_points: ${frustum_filter.min_points}
+    min_keep_ratio: ${frustum_filter.min_keep_ratio}
+    mode: ${frustum_filter.mode}
+    on_threshold_failure: ${frustum_filter.on_threshold_failure}
   -
     type: LoadAnnotations3D
     with_bbox_3d: true

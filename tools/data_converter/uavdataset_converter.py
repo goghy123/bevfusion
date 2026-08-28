@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import yaml
 from PIL import Image, ImageDraw
 
 
@@ -172,44 +173,97 @@ def inspect_scene_files(scene_dir: Path, allow_partial: bool) -> dict:
     }
 
 
-def allocate_split_counts(num_items: int, ratios: Sequence[float]) -> List[int]:
-    ratios_array = np.asarray(ratios, dtype=np.float64)
-    if ratios_array.shape != (3,) or np.any(ratios_array < 0.0):
-        raise ValueError("--split-ratios must contain three non-negative values")
-    if not np.isclose(ratios_array.sum(), 1.0, atol=1e-6):
-        raise ValueError("--split-ratios must sum to 1.0")
-    raw = ratios_array * int(num_items)
-    counts = np.floor(raw).astype(np.int64)
-    remaining = int(num_items - counts.sum())
-    fractional_order = np.argsort(-(raw - counts))
-    for index in fractional_order[:remaining]:
-        counts[index] += 1
+def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
+    """Load and validate an explicit scene-level train/val/test assignment.
 
-    nonzero = [index for index, ratio in enumerate(ratios_array) if ratio > 0.0]
-    if num_items >= len(nonzero):
-        for empty_index in [index for index in nonzero if counts[index] == 0]:
-            donor = max(nonzero, key=lambda index: counts[index])
-            if counts[donor] > 1:
-                counts[donor] -= 1
-                counts[empty_index] += 1
-    return [int(value) for value in counts]
+    YAML format::
 
+        version: 1
+        splits:
+          train: [Town01_Opt, Town02_Opt]
+          val: [Town05_Opt]
+          test: [Town07_Opt]
 
-def scene_split_segments(
-    frame_indices: Sequence[int], keyframe_stride: int, ratios: Sequence[float]
-) -> Dict[str, dict]:
-    candidates = list(frame_indices[::keyframe_stride])
-    counts = allocate_split_counts(len(candidates), ratios)
-    segments = {}
-    offset = 0
-    for split_name, count in zip(SPLIT_NAMES, counts):
-        selected = candidates[offset : offset + count]
-        segments[split_name] = {
-            "candidate_keyframes": selected,
-            "candidate_count": len(selected),
-        }
-        offset += count
-    return segments
+    Every discovered scene must appear exactly once. Keeping assignment at scene
+    granularity prevents map leakage between train/val/test while leaving the
+    generated BEVFusion info schema unchanged.
+    """
+    split_file = Path(split_file).expanduser().resolve()
+    if not split_file.is_file():
+        raise FileNotFoundError("Split YAML does not exist: {}".format(split_file))
+
+    with split_file.open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+
+    if not isinstance(data, dict):
+        raise ValueError("Split YAML must contain a mapping at the top level")
+    splits = data.get("splits")
+    if not isinstance(splits, dict):
+        raise ValueError("Split YAML must contain a 'splits' mapping")
+
+    missing_keys = [name for name in SPLIT_NAMES if name not in splits]
+    extra_keys = [name for name in splits if name not in SPLIT_NAMES]
+    if missing_keys or extra_keys:
+        raise ValueError(
+            "Split YAML must define exactly train/val/test; missing={}, extra={}".format(
+                missing_keys, extra_keys
+            )
+        )
+
+    normalized = {}
+    scene_to_split = {}
+    duplicates = {}
+    for split_name in SPLIT_NAMES:
+        values = splits[split_name]
+        if not isinstance(values, list):
+            raise ValueError("splits.{} must be a YAML list".format(split_name))
+        if not values:
+            raise ValueError("splits.{} must contain at least one scene".format(split_name))
+
+        normalized[split_name] = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    "splits.{} contains an invalid scene name: {!r}".format(
+                        split_name, value
+                    )
+                )
+            scene_name = value.strip()
+            if Path(scene_name).name != scene_name:
+                raise ValueError(
+                    "Scene names in split YAML must be directory basenames, got: {}".format(
+                        scene_name
+                    )
+                )
+            normalized[split_name].append(scene_name)
+            if scene_name in scene_to_split:
+                duplicates.setdefault(scene_name, [scene_to_split[scene_name]]).append(
+                    split_name
+                )
+            else:
+                scene_to_split[scene_name] = split_name
+
+    if duplicates:
+        raise ValueError(
+            "Scenes assigned to more than one split: {}".format(duplicates)
+        )
+
+    discovered = set(scene_names)
+    configured = set(scene_to_split)
+    unknown = sorted(configured - discovered)
+    unassigned = sorted(discovered - configured)
+    if unknown or unassigned:
+        raise ValueError(
+            "Split YAML does not exactly match discovered scenes; unknown={}, "
+            "unassigned={}".format(unknown, unassigned)
+        )
+
+    return {
+        "path": str(split_file),
+        "version": data.get("version", 1),
+        "splits": normalized,
+        "scene_to_split": scene_to_split,
+    }
 
 
 def reference_height_m(pose: dict, altitude_m: float) -> float:
@@ -590,6 +644,10 @@ def convert_dataset(args: argparse.Namespace) -> dict:
     raw_root = Path(args.root_path).expanduser().resolve()
     output_root = Path(args.out_dir).expanduser().resolve()
     scenes = discover_scenes(raw_root)
+    split_config = load_split_config(
+        Path(args.split_file), [scene_dir.name for scene_dir in scenes]
+    )
+    scene_to_split = split_config["scene_to_split"]
     output_root.mkdir(parents=True, exist_ok=True)
 
     info_paths = {
@@ -606,17 +664,20 @@ def convert_dataset(args: argparse.Namespace) -> dict:
 
     infos_by_split = {split_name: [] for split_name in SPLIT_NAMES}
     split_manifest = {
-        "strategy": "per_scene_contiguous",
-        "ratios": list(args.split_ratios),
+        "strategy": "explicit_scene_assignment",
+        "split_file": split_config["path"],
+        "assignments": split_config["splits"],
         "keyframe_stride": int(args.keyframe_stride),
         "max_sweeps": int(args.max_sweeps),
-        "boundary_policy": "keyframes require all sweeps from the same split segment",
+        "boundary_policy": "each scene belongs to exactly one split; sweeps never cross scene boundaries",
         "scenes": {},
     }
     report = {
         "raw_root": str(raw_root),
         "output_root": str(output_root),
         "scene_count": len(scenes),
+        "split_file": split_config["path"],
+        "split_assignments": split_config["splits"],
         "classes": list(SUPPORTED_CLASSES),
         "coordinate_system": "right-handed ground reference: x forward, y left, z up",
         "intensity_scale": float(args.intensity_scale),
@@ -658,162 +719,145 @@ def convert_dataset(args: argparse.Namespace) -> dict:
             raise RuntimeError("Non-finite converted point found in {}".format(scene_name))
 
         tracks = collect_tracks(indices, files["labels"], poses)
-        segments = scene_split_segments(
-            indices, args.keyframe_stride, args.split_ratios
-        )
-        manifest_scene = {}
+        split_name = scene_to_split[scene_name]
+        candidates = list(indices[:: args.keyframe_stride])
+        kept_keyframes = []
+        dropped_keyframes = []
         scene_class_counts = Counter()
-        scene_kept = 0
-        scene_boundary_drops = 0
 
-        for split_name in SPLIT_NAMES:
-            candidates = segments[split_name]["candidate_keyframes"]
-            if not candidates:
-                manifest_scene[split_name] = {
-                    "candidate_keyframes": [],
-                    "kept_keyframes": [],
-                    "dropped_for_sweep_boundary": [],
-                }
-                continue
-            segment_start = candidates[0]
-            segment_end_exclusive = None
-            later_starts = [
-                segments[name]["candidate_keyframes"][0]
-                for name in SPLIT_NAMES[SPLIT_NAMES.index(split_name) + 1 :]
-                if segments[name]["candidate_keyframes"]
-            ]
-            if later_starts:
-                segment_end_exclusive = min(later_starts)
-            allowed_raw = [
-                index
-                for index in indices
-                if index >= segment_start
-                and (segment_end_exclusive is None or index < segment_end_exclusive)
-            ]
-            kept_keyframes = []
-            dropped_keyframes = []
-
-            for frame_index in candidates:
-                if args.max_sweeps > 0:
-                    previous_indices = [
-                        index for index in allowed_raw if index < frame_index
-                    ][-args.max_sweeps :]
-                else:
-                    previous_indices = []
-                if len(previous_indices) < args.max_sweeps:
-                    dropped_keyframes.append(frame_index)
-                    continue
-
-                pose = poses[frame_index]
-                timestamp_us = int(round(float(pose["carla_timestamp"]) * 1e6))
-                world_reference = world_references[frame_index]
-                camera_to_reference = camera_to_reference_transform(
-                    pose, calibration, world_reference
-                )
-                point_path = points_dir / "{:06d}.bin".format(frame_index)
-                image_path = prepare_image_path(
-                    files["rgb"][frame_index],
-                    output_root,
-                    scene_name,
-                    frame_index,
-                    args.image_mode,
-                    args.overwrite,
-                )
-                label = load_json(files["labels"][frame_index])
-                annotations, class_counts = convert_annotations(
-                    label,
-                    float(pose["carla_timestamp"]),
-                    heights[frame_index],
-                    world_reference,
-                    tracks,
-                    args.max_velocity_gap_s,
-                )
-                scene_class_counts.update(class_counts)
-
-                camera_info = {
-                    "data_path": image_path,
-                    "type": "CAM_DOWN",
-                    "sample_data_token": "{}/{:06d}/CAM_DOWN".format(
-                        scene_name, frame_index
-                    ),
-                    "sensor2ego_translation": camera_to_reference[:3, 3].tolist(),
-                    "sensor2ego_rotation": matrix_to_quaternion(
-                        camera_to_reference[:3, :3]
-                    ),
-                    "ego2global_translation": world_reference[:3, 3].tolist(),
-                    "ego2global_rotation": matrix_to_quaternion(
-                        world_reference[:3, :3]
-                    ),
-                    "timestamp": timestamp_us,
-                    "sensor2lidar_rotation": camera_to_reference[
-                        :3, :3
-                    ].astype(np.float32),
-                    "sensor2lidar_translation": camera_to_reference[
-                        :3, 3
-                    ].astype(np.float32),
-                    "camera_intrinsics": np.asarray(
-                        calibration["K"], dtype=np.float32
-                    ),
-                    "image_size": [
-                        int(calibration["camera_resolution"][0]),
-                        int(calibration["camera_resolution"][1]),
-                    ],
-                }
-                sweeps = [
-                    build_sweep(
-                        scene_name,
-                        previous_index,
-                        points_dir / "{:06d}.bin".format(previous_index),
-                        int(
-                            round(
-                                float(poses[previous_index]["carla_timestamp"]) * 1e6
-                            )
-                        ),
-                        world_references[previous_index],
-                        world_reference,
-                        output_root,
-                    )
-                    for previous_index in reversed(previous_indices)
+        # Candidate keyframes remain every Nth raw frame, but the entire scene
+        # belongs to one split. Sweeps can use earlier raw frames from this same
+        # scene only, so they never leak across maps/splits.
+        position_by_index = {
+            frame_index: pos for pos, frame_index in enumerate(indices)
+        }
+        for frame_index in candidates:
+            position = position_by_index[frame_index]
+            if args.max_sweeps > 0:
+                previous_indices = indices[
+                    max(0, position - args.max_sweeps) : position
                 ]
-                info = {
-                    "lidar_path": portable_path(point_path, output_root),
-                    "token": "{}/{:06d}".format(scene_name, frame_index),
-                    "scene_name": scene_name,
-                    "frame_index": int(frame_index),
-                    "split": split_name,
-                    "sweeps": sweeps,
-                    "cams": {"CAM_DOWN": camera_info},
-                    "lidar2ego_translation": [0.0, 0.0, 0.0],
-                    "lidar2ego_rotation": [1.0, 0.0, 0.0, 0.0],
-                    "ego2global_translation": world_reference[:3, 3].tolist(),
-                    "ego2global_rotation": matrix_to_quaternion(
-                        world_reference[:3, :3]
-                    ),
-                    "timestamp": timestamp_us,
-                    "location": str(metadata.get("route_map", "unknown")),
-                    "route_name": str(metadata.get("route_name", "unknown")),
-                    "source_label_path": portable_path(
-                        files["labels"][frame_index], output_root
-                    ),
-                }
-                info.update(annotations)
-                infos_by_split[split_name].append(info)
-                kept_keyframes.append(frame_index)
-                scene_kept += 1
+            else:
+                previous_indices = []
+            if len(previous_indices) < args.max_sweeps:
+                dropped_keyframes.append(frame_index)
+                continue
 
-            scene_boundary_drops += len(dropped_keyframes)
-            manifest_scene[split_name] = {
-                "candidate_keyframes": candidates,
-                "kept_keyframes": kept_keyframes,
-                "dropped_for_sweep_boundary": dropped_keyframes,
-                "raw_segment_start": int(segment_start),
-                "raw_segment_end_exclusive": (
-                    int(segment_end_exclusive)
-                    if segment_end_exclusive is not None
-                    else None
+            pose = poses[frame_index]
+            timestamp_us = int(round(float(pose["carla_timestamp"]) * 1e6))
+            world_reference = world_references[frame_index]
+            camera_to_reference = camera_to_reference_transform(
+                pose, calibration, world_reference
+            )
+            point_path = points_dir / "{:06d}.bin".format(frame_index)
+            image_path = prepare_image_path(
+                files["rgb"][frame_index],
+                output_root,
+                scene_name,
+                frame_index,
+                args.image_mode,
+                args.overwrite,
+            )
+            label = load_json(files["labels"][frame_index])
+            annotations, class_counts = convert_annotations(
+                label,
+                float(pose["carla_timestamp"]),
+                heights[frame_index],
+                world_reference,
+                tracks,
+                args.max_velocity_gap_s,
+            )
+            scene_class_counts.update(class_counts)
+
+            camera_info = {
+                "data_path": image_path,
+                "type": "CAM_DOWN",
+                "sample_data_token": "{}/{:06d}/CAM_DOWN".format(
+                    scene_name, frame_index
+                ),
+                "sensor2ego_translation": camera_to_reference[:3, 3].tolist(),
+                "sensor2ego_rotation": matrix_to_quaternion(
+                    camera_to_reference[:3, :3]
+                ),
+                "ego2global_translation": world_reference[:3, 3].tolist(),
+                "ego2global_rotation": matrix_to_quaternion(
+                    world_reference[:3, :3]
+                ),
+                "timestamp": timestamp_us,
+                "sensor2lidar_rotation": camera_to_reference[:3, :3].astype(
+                    np.float32
+                ),
+                "sensor2lidar_translation": camera_to_reference[:3, 3].astype(
+                    np.float32
+                ),
+                "camera_intrinsics": np.asarray(
+                    calibration["K"], dtype=np.float32
+                ),
+                "image_size": [
+                    int(calibration["camera_resolution"][0]),
+                    int(calibration["camera_resolution"][1]),
+                ],
+            }
+            sweeps = [
+                build_sweep(
+                    scene_name,
+                    previous_index,
+                    points_dir / "{:06d}.bin".format(previous_index),
+                    int(
+                        round(
+                            float(poses[previous_index]["carla_timestamp"]) * 1e6
+                        )
+                    ),
+                    world_references[previous_index],
+                    world_reference,
+                    output_root,
+                )
+                for previous_index in reversed(previous_indices)
+            ]
+            info = {
+                "lidar_path": portable_path(point_path, output_root),
+                "token": "{}/{:06d}".format(scene_name, frame_index),
+                "scene_name": scene_name,
+                "frame_index": int(frame_index),
+                "split": split_name,
+                "sweeps": sweeps,
+                "cams": {"CAM_DOWN": camera_info},
+                "lidar2ego_translation": [0.0, 0.0, 0.0],
+                "lidar2ego_rotation": [1.0, 0.0, 0.0, 0.0],
+                "ego2global_translation": world_reference[:3, 3].tolist(),
+                "ego2global_rotation": matrix_to_quaternion(
+                    world_reference[:3, :3]
+                ),
+                "timestamp": timestamp_us,
+                "location": str(metadata.get("route_map", "unknown")),
+                "route_name": str(metadata.get("route_name", "unknown")),
+                "source_label_path": portable_path(
+                    files["labels"][frame_index], output_root
                 ),
             }
+            info.update(annotations)
+            infos_by_split[split_name].append(info)
+            kept_keyframes.append(frame_index)
 
+        # Keep the old per-split diagnostic shape for each scene. Only the
+        # assigned split contains frames. split_manifest.json is diagnostic and
+        # is not consumed by UAVDataset.
+        manifest_scene = {
+            name: {
+                "candidate_keyframes": [],
+                "kept_keyframes": [],
+                "dropped_for_sweep_boundary": [],
+            }
+            for name in SPLIT_NAMES
+        }
+        manifest_scene[split_name] = {
+            "candidate_keyframes": candidates,
+            "kept_keyframes": kept_keyframes,
+            "dropped_for_sweep_boundary": dropped_keyframes,
+            "raw_segment_start": int(indices[0]),
+            "raw_segment_end_exclusive": int(indices[-1]) + 1,
+        }
+        manifest_scene["assigned_split"] = split_name
         split_manifest["scenes"][scene_name] = manifest_scene
         first_info = next(
             (
@@ -831,8 +875,9 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                 metadata.get("actual_num_frames", len(indices))
             ),
             "partial_scene": bool(inspected["incomplete"]),
-            "keyframes_kept": int(scene_kept),
-            "keyframes_dropped_for_boundaries": int(scene_boundary_drops),
+            "assigned_split": split_name,
+            "keyframes_kept": int(len(kept_keyframes)),
+            "keyframes_dropped_for_boundaries": int(len(dropped_keyframes)),
             "class_counts": dict(scene_class_counts),
             "point_count_min": int(min(item["num_points"] for item in point_reports)),
             "point_count_max": int(max(item["num_points"] for item in point_reports)),
@@ -904,11 +949,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--out-dir", default="data/uavdataset", help="Converted dataset output root"
     )
     parser.add_argument(
-        "--split-ratios",
-        type=float,
-        nargs=3,
-        default=(0.70, 0.15, 0.15),
-        metavar=("TRAIN", "VAL", "TEST"),
+        "--split-file",
+        required=True,
+        help="YAML file assigning every scene directory to train/val/test",
     )
     parser.add_argument("--keyframe-stride", type=int, default=5)
     parser.add_argument("--max-sweeps", type=int, default=9)

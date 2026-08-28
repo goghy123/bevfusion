@@ -7,6 +7,210 @@ from mmdet.datasets.builder import PIPELINES
 from .transforms_3d import ImageAug3D
 
 
+
+@PIPELINES.register_module()
+class LiDARCameraFrustumFilter:
+    """Keep LiDAR points visible in the raw camera frustum.
+
+    The frustum is derived from ``lidar2image`` and the actual loaded image
+    size. No camera FOV, resolution, altitude, or mounting angle is hard-coded.
+    With multiple cameras, ``mode='union'`` keeps a point if it is visible in
+    at least one camera.
+
+    This transform should run after multi-sweep loading and before image
+    augmentation. Dataset GT visibility is defined from the raw sensors, while
+    random image crop/resize/flip/rotation is only training augmentation.
+
+    Args:
+        min_depth (float): Minimum positive camera depth in metres.
+        max_depth (float | None): Optional maximum camera depth.
+        margin_px (float): Shrink each image border by this many pixels.
+        min_points (int): Minimum number of retained points.
+        min_keep_ratio (float): Minimum retained/original point ratio.
+        mode (str): ``union`` or ``intersection`` for multiple cameras.
+        on_threshold_failure (str): ``raise`` or ``keep``.
+    """
+
+    def __init__(
+        self,
+        min_depth=0.05,
+        max_depth=None,
+        margin_px=2.0,
+        min_points=1000,
+        min_keep_ratio=0.005,
+        mode="union",
+        on_threshold_failure="raise",
+    ):
+        self.min_depth = float(min_depth)
+        self.max_depth = None if max_depth is None else float(max_depth)
+        self.margin_px = float(margin_px)
+        self.min_points = int(min_points)
+        self.min_keep_ratio = float(min_keep_ratio)
+        self.mode = str(mode)
+        self.on_threshold_failure = str(on_threshold_failure)
+
+        if self.min_depth <= 0:
+            raise ValueError("min_depth must be > 0")
+        if self.max_depth is not None and self.max_depth <= self.min_depth:
+            raise ValueError("max_depth must be greater than min_depth")
+        if self.margin_px < 0:
+            raise ValueError("margin_px must be >= 0")
+        if self.min_points < 0:
+            raise ValueError("min_points must be >= 0")
+        if not 0.0 <= self.min_keep_ratio <= 1.0:
+            raise ValueError("min_keep_ratio must be in [0, 1]")
+        if self.mode not in ("union", "intersection"):
+            raise ValueError("mode must be 'union' or 'intersection'")
+        if self.on_threshold_failure not in ("raise", "keep"):
+            raise ValueError("on_threshold_failure must be 'raise' or 'keep'")
+
+    @staticmethod
+    def _image_size(image):
+        # PIL.Image.size is (width, height). Keep numpy support for reuse.
+        if hasattr(image, "size") and not isinstance(image, np.ndarray):
+            width, height = image.size
+            return int(width), int(height)
+        if isinstance(image, np.ndarray):
+            height, width = image.shape[:2]
+            return int(width), int(height)
+        raise TypeError(
+            "Unsupported image type for frustum filtering: {}".format(type(image))
+        )
+
+    def __call__(self, data):
+        if "points" not in data:
+            raise KeyError("LiDARCameraFrustumFilter requires data['points']")
+        if "lidar2image" not in data:
+            raise KeyError("LiDARCameraFrustumFilter requires data['lidar2image']")
+        if "img" not in data:
+            raise KeyError("LiDARCameraFrustumFilter requires loaded data['img']")
+
+        points = data["points"]
+        num_points = len(points)
+        if num_points == 0:
+            raise RuntimeError(
+                "LiDARCameraFrustumFilter received an empty point cloud"
+            )
+
+        images = list(data["img"])
+        matrices = list(data["lidar2image"])
+        if len(images) != len(matrices) or len(images) == 0:
+            raise RuntimeError(
+                "Camera/image calibration mismatch: {} images vs {} "
+                "lidar2image matrices".format(len(images), len(matrices))
+            )
+
+        xyz = (
+            points.tensor[:, :3]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+        homogeneous = np.ones((num_points, 4), dtype=np.float64)
+        homogeneous[:, :3] = xyz
+
+        if self.mode == "union":
+            keep = np.zeros(num_points, dtype=bool)
+        else:
+            keep = np.ones(num_points, dtype=bool)
+
+        per_camera = []
+        for camera_index, (image, matrix) in enumerate(zip(images, matrices)):
+            matrix = np.asarray(matrix, dtype=np.float64)
+            if matrix.shape != (4, 4):
+                raise ValueError(
+                    "lidar2image[{}] must be 4x4, got {}".format(
+                        camera_index, matrix.shape
+                    )
+                )
+
+            width, height = self._image_size(image)
+            if width <= 2 * self.margin_px or height <= 2 * self.margin_px:
+                raise ValueError(
+                    "margin_px={} leaves no valid image area for {}x{} image".format(
+                        self.margin_px, width, height
+                    )
+                )
+
+            projected = homogeneous @ matrix.T
+            depth = projected[:, 2]
+            valid_depth = np.isfinite(depth) & (depth > self.min_depth)
+            if self.max_depth is not None:
+                valid_depth &= depth <= self.max_depth
+
+            u = np.full(num_points, np.nan, dtype=np.float64)
+            v = np.full(num_points, np.nan, dtype=np.float64)
+            u[valid_depth] = projected[valid_depth, 0] / depth[valid_depth]
+            v[valid_depth] = projected[valid_depth, 1] / depth[valid_depth]
+
+            visible = (
+                valid_depth
+                & np.isfinite(u)
+                & np.isfinite(v)
+                & (u >= self.margin_px)
+                & (u < width - self.margin_px)
+                & (v >= self.margin_px)
+                & (v < height - self.margin_px)
+            )
+
+            if self.mode == "union":
+                keep |= visible
+            else:
+                keep &= visible
+            per_camera.append(int(visible.sum()))
+
+        kept_points = int(keep.sum())
+        keep_ratio = float(kept_points / max(num_points, 1))
+        data["frustum_filter_stats"] = {
+            "before": int(num_points),
+            "after": kept_points,
+            "keep_ratio": keep_ratio,
+            "per_camera_visible": per_camera,
+            "mode": self.mode,
+        }
+
+        threshold_failed = (
+            kept_points < self.min_points or keep_ratio < self.min_keep_ratio
+        )
+        if threshold_failed:
+            message = (
+                "LiDARCameraFrustumFilter threshold failure: before={}, "
+                "after={}, keep_ratio={:.6f}, per_camera={}, min_points={}, "
+                "min_keep_ratio={:.6f}. Check camera intrinsics/extrinsics, "
+                "image resolution/FOV, and LiDAR-to-camera calibration."
+            ).format(
+                num_points,
+                kept_points,
+                keep_ratio,
+                per_camera,
+                self.min_points,
+                self.min_keep_ratio,
+            )
+            if self.on_threshold_failure == "raise":
+                raise RuntimeError(message)
+            data["frustum_filter_stats"]["threshold_failure"] = message
+            return data
+
+        data["points"] = points[keep]
+        return data
+
+    def __repr__(self):
+        return (
+            "{}(min_depth={}, max_depth={}, margin_px={}, min_points={}, "
+            "min_keep_ratio={}, mode={!r}, on_threshold_failure={!r})"
+        ).format(
+            self.__class__.__name__,
+            self.min_depth,
+            self.max_depth,
+            self.margin_px,
+            self.min_points,
+            self.min_keep_ratio,
+            self.mode,
+            self.on_threshold_failure,
+        )
+
+
 @PIPELINES.register_module()
 class UAVImageAug3D(ImageAug3D):
     """ImageAug3D with a centered vertical crop for top-down imagery.
@@ -80,4 +284,4 @@ class UAVImageAug3D(ImageAug3D):
         )
 
 
-__all__ = ["UAVImageAug3D"]
+__all__ = ["LiDARCameraFrustumFilter", "UAVImageAug3D"]

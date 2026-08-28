@@ -1,0 +1,17 @@
+version: 1
+
+# One Town/map must belong to exactly one split.
+splits:
+  train:
+    - Town01_Opt
+    - Town02_Opt
+    - Town03_Opt
+    - Town04_Opt
+    - Town06_Opt
+
+  val:
+    - Town05_Opt
+
+  test:
+    - Town07_Opt
+    - Town10HD_Opt

@@ -2,19 +2,23 @@
 
 本实现用于 `collect_uavdataset.py` v3.3 生成的数据。任务定义为：使用一个俯视 RGB 相机和一个 128 线俯视 LiDAR，检测同时满足录制器 LiDAR 与 RGB 可见性门槛的 `car / van / truck / bus` 三维目标。
 
+当前适用数据集包含多个不同 CARLA Town。通过 YAML 文件显式指定完整 scene/Town 的归属。
+
 ## 1. 原始数据要求
 
-传给转换器的根目录下可以包含任意数量、任意名称的 scene。转换器不依赖 `scene_` 前缀，而是识别以下完整结构：
+传给转换器的根目录下可以包含任意数量、任意名称的 scene。随后转换器识别以下完整结构：
 
 ```text
 raw_dataset/
-├── scene_xxx/
+├── Town01_Opt/
 │   ├── calibration.json
 │   ├── metadata.json
 │   ├── rgb/000000.png
 │   ├── lidar/000000.bin
 │   ├── pose/000000.json
 │   └── labels/000000.json
+├── Town02_Opt/
+│   └── ...
 └── another_scene/
     └── ...
 ```
@@ -26,7 +30,10 @@ raw_dataset/
 - 文件数等于 `metadata.json.actual_num_frames`；
 - 点云严格为 `N×4 float32`；
 - LiDAR 保持水平安装；
-- 转换后的矩阵、点云均为有限数值。
+- 转换后的矩阵、点云均为有限数值；
+- YAML 中的每个 scene 名称都真实存在；
+- 每个发现的 scene 必须且只能分配到 `train / val / test` 其中一个；
+- `train / val / test` 三个列表都必须存在且非空。
 
 `--allow-partial-scenes` 只用于首帧样例或调试，不应对正式训练数据使用。
 
@@ -50,24 +57,54 @@ z：上方
 - 把 4 维点扩展为 `[x,y,z,intensity,time_lag]` 五维点；
 - 把 CARLA 强度默认乘以 255，以接近 nuScenes 预训练输入范围；
 - 由相同 actor 的相邻世界坐标标注估计速度；静态或无法估计时为 0；
-- 为每个关键帧建立只来自同一数据划分区段的历史 sweeps。
+- 为每个关键帧建立只来自**同一 scene/Town 更早原始帧**的历史 sweeps，绝不跨 scene 或跨 split 使用点云。
 
 三维框在 info 文件中保存几何中心，`UAVDataset` 加载时会正确转成该 BEVFusion 分支要求的底面中心。
 
-## 3. 运行转换
+## 3. 数据划分 YAML
+
+数据集划分由 `--split-file` 指定的 YAML 文件控制。当前推荐配置位于：
+
+```text
+configs/uavdataset/splits/town_split_v1.yaml
+```
+
+当前扩充数据集采用：
+
+```yaml
+version: 1
+
+splits:
+  train:
+    - Town01_Opt
+    - Town02_Opt
+    - Town03_Opt
+    - Town04_Opt
+    - Town06_Opt
+
+  val:
+    - Town05_Opt
+
+  test:
+    - Town07_Opt
+    - Town10HD_Opt
+```
+
+## 4. 运行转换
 
 在 BEVFusion 仓库根目录执行：
 
 ```bash
 python tools/create_uavdataset.py \
-  --root-path /absolute/path/to/carla_project/dataset \
+  --root-path data/uavdataset/raw \
   --out-dir data/uavdataset \
-  --split-ratios 0.70 0.15 0.15 \
+  --split-file configs/uavdataset/splits/town_split_v1.yaml \
   --keyframe-stride 5 \
   --max-sweeps 9 \
   --intensity-scale 255 \
   --image-mode reference \
-  --visualize-samples 6
+  --visualize-samples 6 \
+  --overwrite
 ```
 
 默认 `image-mode=reference` 不复制体积较大的 PNG，而是在 info 文件中保存相对于输出目录的路径。原始数据目录在训练期间必须保留。其他选项：
@@ -78,7 +115,7 @@ python tools/create_uavdataset.py \
 
 重复生成时显式增加 `--overwrite`。转换器不会递归删除输出目录。
 
-输出结构：
+输出结构如下：
 
 ```text
 data/uavdataset/
@@ -96,16 +133,62 @@ data/uavdataset/
 1. `conversion_report.json` 中没有 partial scene；
 2. 每个正式 scene 的 `projection_audit.in_image_ratio` 合理；
 3. train、val、test 都有样本；
-4. 四类计数符合预期；
-5. `validation` 中的框与车辆点簇对齐。
+4. 四类计数符合预期，尤其确认 val/test 没有类别完全缺失；
+5. `validation` 中的框与车辆点簇对齐；
+6. `split_manifest.json` 中每个 scene 的 `assigned_split` 与 YAML 一致。
 
-## 4. 数据划分定义
+## 5. 关键帧与 sweeps
 
-每个 scene 分别按时间顺序划成 `70% train / 15% val / 15% test`。原始 10 Hz 帧每 5 帧选一个关键帧，即约 2 Hz；中间帧仍用于 9 个历史 LiDAR sweeps。
+原始数据为 10 Hz。使用：
 
-划分边界不共享 sweep。每个区段开头会跳过尚未积累满 9 个历史帧的关键帧。具体帧编号完整记录在 `split_manifest.json`，因此划分可复现且不会出现相邻帧跨集合泄漏。
+```text
+--keyframe-stride 5
+```
 
-## 5. 准备预训练权重
+时，每 5 个原始帧选一个候选关键帧，即约 2 Hz。中间原始帧不会作为独立训练样本，但仍用于构建历史 LiDAR sweeps。
+
+使用：
+
+```text
+--max-sweeps 9
+```
+
+时，每个关键帧最多使用同一 scene 中更早的 9 个原始 LiDAR 帧。sweeps 按时间从近到远写入，并包含相对于当前关键帧的位姿变换和 `time_lag`。
+
+由于当前划分单位是完整 scene/Town：
+
+- sweep 不需要在 scene 内人为的 train/val/test 时间边界重新截断；
+- sweep 永远不会跨 Town；
+- sweep 永远不会跨 train/val/test；
+- 每个 Town 开头历史帧不足的候选关键帧会被跳过；
+- 后续关键帧可以连续使用该 Town 自身的历史原始帧。
+
+例如连续帧从 0 开始、`keyframe_stride=5`、`max_sweeps=9` 时，候选关键帧为 `0, 5, 10, 15, ...`。其中前两个候选帧历史不足，`frame 10` 开始可以获得 9 个历史 sweeps。
+
+具体候选关键帧、保留关键帧以及因历史不足被跳过的关键帧都会记录在 `split_manifest.json`。
+
+## 6. 当前扩充数据集的转换结果
+
+使用 `town_split_v1.yaml`、`keyframe_stride=5`、`max_sweeps=9` 转换当前扩充数据集后，得到：
+
+| split | Town | samples | empty samples | car | van | truck | bus |
+|---|---|---:|---:|---:|---:|---:|---:|
+| train | Town01 / Town02 / Town03 / Town04 / Town06 | 4102 | 873 | 22589 | 4168 | 3404 | 491 |
+| val | Town05 | 976 | 104 | 5872 | 951 | 1283 | 117 |
+| test | Town07 / Town10HD | 809 | 91 | 4077 | 539 | 773 | 129 |
+
+总计：
+
+```text
+samples = 5887
+train / val / test = 4102 / 976 / 809
+```
+
+四个目标类别在 train、val、test 中均有样本，因此当前划分可用于后续训练和跨地图泛化评估。
+
+`conversion_report.json` 中的 `empty_samples` 表示生成的 info 中没有有效 GT 的关键帧数量。训练配置当前对 train 使用 `filter_empty_gt=True`，因此转换文件中的 train `samples` 数量不一定等于训练时最终参与采样的数据集长度；这与地图划分逻辑本身无关。
+
+## 7. 准备预训练权重
 
 配置采用四类新检测头，同时图像尺寸、深度 bins 和 BEV 范围不同于 nuScenes。先过滤官方或原 nuScenes BEVFusion 检测 checkpoint：
 
@@ -131,7 +214,7 @@ python tools/filter_uav_pretrained.py \
 
 因此不要把原始十类 checkpoint 直接传给本配置。
 
-## 6. 训练
+## 8. 训练
 
 配置文件：
 
@@ -148,12 +231,16 @@ torchpack dist-run -np 1 python tools/train.py \
   --load_from pretrained/bevfusion-uav-init.pth
 ```
 
-同时屏幕显示 + 写入日志:
+同时屏幕显示 + 写入日志：(设置data.workers_per_gpu = 4)
+
 ```bash
 torchpack dist-run -np 1 python tools/train.py \
   configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
   --run-dir runs/uavdataset-bevfusion \
-  --load_from pretrained/bevfusion-uav-init.pth 2>&1 | tee train_log.txt
+  --load_from pretrained/bevfusion-uav-init.pth \
+  --data.workers_per_gpu 4 \
+  2>&1 | tee train_log.txt
+
 ```
 
 当前默认值：
@@ -169,7 +256,7 @@ torchpack dist-run -np 1 python tools/train.py \
 
 如果显存不足，优先减小 `image_size` 和 `max_voxels`，不要直接缩小 z 范围或改变点云维数。
 
-## 7. 测试与评估
+## 9. 测试与评估
 
 ```bash
 python tools/test.py \
@@ -192,7 +279,9 @@ python tools/test.py <config> <checkpoint> --eval bbox \
   --eval-options iou_threshold=0.7 score_threshold=0.2
 ```
 
-## 8. 任务边界
+当前 test 集由 `Town07_Opt + Town10HD_Opt` 构成，二者均不出现在 train 中，因此该结果主要反映模型对未见地图的泛化能力，而不是同地图不同时间段上的插值能力。
+
+## 10. 任务边界
 
 - 当前标注由录制器按 LiDAR 点数和 RGB 可见像素共同硬筛选；转换器不会恢复被录制器删除的目标。
 - 该配置学习的是“两种传感器共同可见目标”，与仅按 LiDAR 可见性保留全部三维目标的任务不同。
