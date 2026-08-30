@@ -279,9 +279,124 @@ test_predictions/
    └─ ...
 ```
 
-## 10. 任务边界
+# UAV Multi-Sweep Voxel 容量统计
 
-- 当前标注由录制器按 LiDAR 点数和 RGB 可见像素共同硬筛选；转换器不会恢复被录制器删除的目标。
-- 该配置学习的是“两种传感器共同可见目标”，与仅按 LiDAR 可见性保留全部三维目标的任务不同。
-- 一张俯视相机可直接作为视图数 `N=1` 输入 BEVFusion，不复制成六视图。
-- 当前不支持 BEV 地图分割，因为数据中没有 nuScenes map expansion 对应的地图层标注。
+## 目的
+
+`profile_uav_sweeps_voxels.py` 用于统计不同历史 LiDAR sweep 数量下，进入 voxelizer 前实际产生的非空 voxel 数量，从而确定合理的：
+
+* `max_sweeps`
+* `model.encoders.lidar.voxelize.max_voxels`
+
+主要用于避免 multi-sweep 点云已经加载，但由于 `max_voxels` 过小而在 voxelization 阶段大量截断。
+
+
+## 使用方法
+
+在 BEVFusion 项目根目录执行：
+
+```bash
+python tools/profile_uav_sweeps_voxels.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
+  --converted-root data/uavdataset \
+  --sweeps 3 6 9 \
+  --max-samples-per-split 0 \
+  --train-augment-repeats 2 \
+  --output uav_sweep_voxel_profile.json
+```
+
+参数说明：
+
+```text
+--sweeps 3 6 9
+    分别统计3、6、9个历史sweep。
+    当前帧不计入该数字，因此3 sweeps表示当前帧+3历史帧。
+
+--max-samples-per-split 0
+    统计整个train/val/test数据集，不限制采样数量。
+
+--train-augment-repeats 2
+    对训练集重复模拟两次3D数据增强，以覆盖增强造成的voxel数量变化。
+
+--output
+    指定JSON统计结果文件。
+```
+
+数据集更新并重新生成 `uavdataset_infos_*.pkl` 后，应重新运行本脚本。
+
+## 统计方法
+
+每个 sweep 配置按照：
+
+```text
+当前LiDAR
++ 最近N个历史LiDAR
+→ 历史帧坐标变换
+→ Frustum Filter
+→ 训练集3D Augmentation
+→ Point Cloud Range Filter
+→ Voxelization
+→ 统计截断前非空voxel数量
+```
+
+主要输出：
+
+```text
+p50
+p95
+p99
+p99.5
+max
+```
+
+并对不同 `max_voxels` 候选值统计：
+
+```text
+sample_overflow_rate
+mean_candidate_voxel_drop_ratio
+p99_candidate_voxel_drop_ratio
+```
+
+## 参数确定方法
+
+一般使用：
+
+```text
+Train max_voxels：
+参考Train的p99～max。
+
+Test max_voxels：
+参考Val/Test中较大的p99～max。
+```
+
+如果优先控制显存和速度，可接近 `p95/p99`。
+
+如果希望基本不截断，可取接近 `max` 并向上取整。
+
+当前数据(uavdataset_v1.0)统计得到的建议为：
+
+```yaml
+# 3 historical sweeps
+max_sweeps: 3
+max_voxels: [95000, 100000]
+
+# 6 historical sweeps
+max_sweeps: 6
+max_voxels: [150000, 155000]
+
+# 9 historical sweeps
+max_sweeps: 9
+max_voxels: [200000, 205000]
+```
+
+最终通过 3/6/9 sweep 独立训练，比较：
+
+```text
+3D mAP
+BEV mAP
+GPU显存
+训练速度
+推理延迟
+```
+
+后确定最终部署配置。
