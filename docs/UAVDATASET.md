@@ -228,33 +228,10 @@ configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml
 torchpack dist-run -np 1 python tools/train.py \
   configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
   --run-dir runs/uavdataset-bevfusion \
-  --load_from pretrained/bevfusion-uav-init.pth
-```
-
-同时屏幕显示 + 写入日志：(设置data.workers_per_gpu = 4)
-
-```bash
-torchpack dist-run -np 1 python tools/train.py \
-  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
-  --run-dir runs/uavdataset-bevfusion \
   --load_from pretrained/bevfusion-uav-init.pth \
   --data.workers_per_gpu 4 \
-  2>&1 | tee train_log.txt
-
+  2>&1 | tee runs/uavdataset-bevfusion/train_log.txt
 ```
-
-当前默认值：
-
-- 输入图像 `320×576`，像素量与 nuScenes 的 `256×704` 接近；
-- 单相机，保留接近完整的 16:9 俯视画面；
-- 相机深度范围 `1–70 m`；
-- 点云范围 `[-51.2,-51.2,-5, 51.2,51.2,3]`；
-- voxel size `[0.1,0.1,0.2]`；
-- batch size 1；
-- 20 epochs；
-- 不加载 nuScenes 地图、不做 ObjectPaste、不做 32 线降采样。
-
-如果显存不足，优先减小 `image_size` 和 `max_voxels`，不要直接缩小 z 范围或改变点云维数。
 
 ## 9. 测试与评估
 
@@ -262,7 +239,9 @@ torchpack dist-run -np 1 python tools/train.py \
 python tools/test.py \
   configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
   runs/uavdataset-bevfusion/latest.pth \
-  --eval bbox
+  --out runs/uavdataset-bevfusion/test_results.pkl \
+  --eval bbox \
+  2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
 ```
 
 `UAVDataset` 不调用 nuScenes devkit，也不伪造 NDS。默认报告：
@@ -279,7 +258,26 @@ python tools/test.py <config> <checkpoint> --eval bbox \
   --eval-options iou_threshold=0.7 score_threshold=0.2
 ```
 
-当前 test 集由 `Town07_Opt + Town10HD_Opt` 构成，二者均不出现在 train 中，因此该结果主要反映模型对未见地图的泛化能力，而不是同地图不同时间段上的插值能力。
+保存测试json结果，用于可视化：
+```BASH
+python tools/test_uav_predictions.py
+```
+
+结果目录应类似：
+
+```text
+test_predictions/
+├─ manifest.json
+├─ metrics.json
+├─ summary.json
+├─ timing.csv
+└─ predictions/
+   ├─ Town07_Opt/
+   │  ├─ 000009.json
+   │  ├─ 000012.json
+   │  └─ ...
+   └─ ...
+```
 
 ## 10. 任务边界
 
