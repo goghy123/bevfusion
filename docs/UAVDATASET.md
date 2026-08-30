@@ -251,7 +251,7 @@ torchpack dist-run -np 1 python tools/train.py \
   --run-dir runs/uavdataset-bevfusion-s6 \
   --load_from pretrained/bevfusion-uav-init.pth \
   --data.workers_per_gpu 4
-  2>&1 | tee runs/uavdataset-bevfusion/train_log.txt
+  2>&1 | tee runs/uavdataset-bevfusion-s6/train_log.txt
 ```
 
 对于`sweeps=3、9`的情况，修改对应的config以及指令中的文件后缀即可。
