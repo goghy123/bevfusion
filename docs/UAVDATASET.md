@@ -107,14 +107,6 @@ python tools/create_uavdataset.py \
   --overwrite
 ```
 
-默认 `image-mode=reference` 不复制体积较大的 PNG，而是在 info 文件中保存相对于输出目录的路径。原始数据目录在训练期间必须保留。其他选项：
-
-- `copy`：复制图像，最便于移动，空间占用最大；
-- `hardlink`：同一文件系统内不额外占空间；
-- `symlink`：创建相对符号链接。
-
-重复生成时显式增加 `--overwrite`。转换器不会递归删除输出目录。
-
 输出结构如下：
 
 ```text
@@ -128,44 +120,66 @@ data/uavdataset/
 └── validation/*_bev.png
 ```
 
-请先检查：
+## 5. sweep划分
 
-1. `conversion_report.json` 中没有 partial scene；
-2. 每个正式 scene 的 `projection_audit.in_image_ratio` 合理；
-3. train、val、test 都有样本；
-4. 四类计数符合预期，尤其确认 val/test 没有类别完全缺失；
-5. `validation` 中的框与车辆点簇对齐；
-6. `split_manifest.json` 中每个 scene 的 `assigned_split` 与 YAML 一致。
+### 数据转换
 
-## 5. 关键帧与 sweeps
+将数据集按sweep=3、6、9划分，使用如下指令读取已有 PKL，截取最近 N 个 sweep：
 
-原始数据为 10 Hz。使用：
-
-```text
---keyframe-stride 5
+```bash
+python tools/data_converter/derive_uav_sweep_infos.py \
+  --dataset-root data/uavdataset \
+  --sweeps 3 6 9
 ```
 
-时，每 5 个原始帧选一个候选关键帧，即约 2 Hz。中间原始帧不会作为独立训练样本，但仍用于构建历史 LiDAR sweeps。
+如果已经存在，需要覆盖：
 
-使用：
-
-```text
---max-sweeps 9
+```bash
+python tools/data_converter/derive_uav_sweep_infos.py \
+  --dataset-root data/uavdataset \
+  --sweeps 3 6 9 \
+  --overwrite
 ```
 
-时，每个关键帧最多使用同一 scene 中更早的 9 个原始 LiDAR 帧。sweeps 按时间从近到远写入，并包含相对于当前关键帧的位姿变换和 `time_lag`。
+### 配置修改
 
-由于当前划分单位是完整 scene/Town：
+同时需要配合修改config
 
-- sweep 不需要在 scene 内人为的 train/val/test 时间边界重新截断；
-- sweep 永远不会跨 Town；
-- sweep 永远不会跨 train/val/test；
-- 每个 Town 开头历史帧不足的候选关键帧会被跳过；
-- 后续关键帧可以连续使用该 Town 自身的历史原始帧。
+- sweeps=6
 
-例如连续帧从 0 开始、`keyframe_stride=5`、`max_sweeps=9` 时，候选关键帧为 `0, 5, 10, 15, ...`。其中前两个候选帧历史不足，`frame 10` 开始可以获得 9 个历史 sweeps。
+`configs/uavdataset/default.yaml`的修改如下：
 
-具体候选关键帧、保留关键帧以及因历史不足被跳过的关键帧都会记录在 `split_manifest.json`。
+```yaml
+max_sweeps: 6
+```
+
+还有
+
+```yaml
+data:
+  train:
+    ann_file: ${dataset_root + "uavdataset_infos_train_s6.pkl"}
+
+  val:
+    ann_file: ${dataset_root + "uavdataset_infos_val_s6.pkl"}
+
+  test:
+    ann_file: ${dataset_root + "uavdataset_infos_test_s6.pkl"}
+```
+
+以及`configs/uavdataset/det/transfusion/secfpn/camera+lidar/default.yaml`：
+
+```yaml
+max_voxels: [150000, 155000]
+```
+
+- sweeps=3、9
+
+`configs/uavdataset/default.yaml`的修改同上，将6的部分替换为sweeps的数字；
+
+`configs/uavdataset/det/transfusion/secfpn/camera+lidar/default.yaml`的修改：
+对于`sweeps=3`:`max_voxels: [95000, 100000]`
+对于`sweeps=9`:`max_voxels: [200000, 205000]`
 
 ## 6. 当前扩充数据集的转换结果
 
@@ -212,17 +226,9 @@ python tools/filter_uav_pretrained.py \
 - 必须由 UAV 配置重新生成的相机 frustum、BEV 几何张量；
 - 深度 bin 数变化导致形状不兼容的最后预测卷积。
 
-因此不要把原始十类 checkpoint 直接传给本配置。
-
 ## 8. 训练
 
-配置文件：
-
-```text
-configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml
-```
-
-单 GPU 示例：
+### 单 GPU 训练
 
 ```bash
 torchpack dist-run -np 1 python tools/train.py \
@@ -233,7 +239,26 @@ torchpack dist-run -np 1 python tools/train.py \
   2>&1 | tee runs/uavdataset-bevfusion/train_log.txt
 ```
 
+### 不同sweep训练
+
+对于`sweeps=6`，先修改对应的config，再执行以下指令：
+
+```bash
+mkdir -p runs/uavdataset-bevfusion-s6
+
+torchpack dist-run -np 1 python tools/train.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
+  --run-dir runs/uavdataset-bevfusion-s6 \
+  --load_from pretrained/bevfusion-uav-init.pth \
+  --data.workers_per_gpu 4
+  2>&1 | tee runs/uavdataset-bevfusion/train_log.txt
+```
+
+对于`sweeps=3、9`的情况，修改对应的config以及指令中的文件后缀即可。
+
 ## 9. 测试与评估
+
+### 评估
 
 ```bash
 python tools/test.py \
@@ -244,7 +269,7 @@ python tools/test.py \
   2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
 ```
 
-`UAVDataset` 不调用 nuScenes devkit，也不伪造 NDS。默认报告：
+默认报告：
 
 - 每类 BEV AP@0.50；
 - 每类 3D AP@0.50；
@@ -257,6 +282,23 @@ python tools/test.py \
 python tools/test.py <config> <checkpoint> --eval bbox \
   --eval-options iou_threshold=0.7 score_threshold=0.2
 ```
+
+### 不同sweep评估
+
+对于`sweeps=6`，先修改对应的config，再执行以下指令：
+
+```bash
+python tools/test.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
+  runs/uavdataset-bevfusion-s6/latest.pth \
+  --out runs/uavdataset-bevfusion-s6/test_results.pkl \
+  --eval bbox \
+  2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
+```
+
+对于`sweeps=3、9`的情况，修改对应的config以及指令中的文件后缀即可。
+
+### 保存结果评估
 
 保存测试json结果，用于可视化：
 ```BASH
