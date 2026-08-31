@@ -293,7 +293,7 @@ python tools/test.py \
   runs/uavdataset-bevfusion-s6/latest.pth \
   --out runs/uavdataset-bevfusion-s6/test_results.pkl \
   --eval bbox \
-  2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
+  2>&1 | tee runs/uavdataset-bevfusion-s6/test_log.txt
 ```
 
 对于`sweeps=3、9`的情况，修改对应的config以及指令中的文件后缀即可。
