@@ -269,13 +269,6 @@ python tools/test.py \
   2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
 ```
 
-默认报告：
-
-- 每类 BEV AP@0.50；
-- 每类 3D AP@0.50；
-- 四类中验证集实际存在类别的 BEV/3D mAP；
-- score≥0.1 时的逐类 precision 和 recall。
-
 可覆盖阈值：
 
 ```bash
@@ -302,23 +295,10 @@ python tools/test.py \
 
 保存测试json结果，用于可视化：
 ```BASH
-python tools/test_uav_predictions.py
-```
-
-结果目录应类似：
-
-```text
-test_predictions/
-├─ manifest.json
-├─ metrics.json
-├─ summary.json
-├─ timing.csv
-└─ predictions/
-   ├─ Town07_Opt/
-   │  ├─ 000009.json
-   │  ├─ 000012.json
-   │  └─ ...
-   └─ ...
+python tools/test_uav_predictions.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
+  runs/uavdataset-bevfusion-s9/latest.pth \
+  --out-dir runs/uavdataset-bevfusion-s9/test_predictions
 ```
 
 # UAV Multi-Sweep Voxel 容量统计
