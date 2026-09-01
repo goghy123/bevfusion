@@ -5,13 +5,27 @@ Exact GT statistics come from converted info files. Point/frustum/voxel
 statistics are sampled because reading every ten-sweep cloud is expensive.
 """
 
+# 抽帧分析
+
 # python tools/audit_uav_pipeline.py \
-#   --raw-root "data/uavdataset/raw" \
-#   --converted-root "data/uavdataset" \
-#   --max-raw-frames-per-scene 200 \
-#   --max-converted-samples-per-split 100 \
+#   --converted-root data/uavdataset/raw \
+#   --splits train val \
+#   --scene train:Town04_Opt \
+#   --scene val:Town05_Opt \
+#   --converted-mode stride \
+#   --sample-every 20 \
 #   --sweeps-num 9 \
-#   --output "uav_audit_report.json"
+#   --point-cloud-range -51.2 -51.2 -12 51.2 51.2 14 \
+#   --output uav_audit_s9_town04_vs_town05_stride20.json
+
+# 全量分析
+# python tools/audit_uav_pipeline.py \
+#   --converted-root data/uavdataset \
+#   --splits train val test \
+#   --converted-mode all \
+#   --sweeps-num 9 \
+#   --point-cloud-range -51.2 -51.2 -12 51.2 51.2 14 \
+#   --output uav_audit_s9_all.json
 
 
 import argparse
@@ -22,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from tqdm.auto import tqdm
 
 from data_converter.uavdataset_converter import (
     S3,
@@ -59,6 +74,76 @@ def choose_evenly(items, limit):
         return items
     indices = np.linspace(0, len(items) - 1, limit, dtype=int)
     return [items[index] for index in indices]
+
+
+
+def parse_scene_filters(values):
+    """Parse repeated SPLIT:SCENE filters into {split: {scene, ...}}."""
+    filters = defaultdict(set)
+    for value in values or []:
+        if ":" not in value:
+            raise ValueError(
+                "Invalid --scene {!r}; expected SPLIT:SCENE, e.g. train:Town04_Opt".format(value)
+            )
+        split, scene = value.split(":", 1)
+        split = split.strip()
+        scene = scene.strip()
+        if split not in ("train", "val", "test") or not scene:
+            raise ValueError(
+                "Invalid --scene {!r}; expected train|val|test:SCENE".format(value)
+            )
+        filters[split].add(scene)
+    return filters
+
+
+def filter_infos_by_scene(infos, split, scene_filters):
+    """Filter only when this split has explicit scene filters."""
+    allowed = scene_filters.get(split)
+    if not allowed:
+        return list(infos)
+    available = {str(info.get("scene_name", "unknown")) for info in infos}
+    missing = sorted(allowed - available)
+    if missing:
+        raise ValueError(
+            "Requested scene(s) not found in {}: {}. Available: {}".format(
+                split, ", ".join(missing), ", ".join(sorted(available))
+            )
+        )
+    return [
+        info for info in infos
+        if str(info.get("scene_name", "unknown")) in allowed
+    ]
+
+
+def choose_every_n_frames(items, every, offset=0):
+    """Select every Nth frame independently inside each scene."""
+    if every <= 0:
+        raise ValueError("--sample-every must be >= 1")
+    if offset < 0 or offset >= every:
+        raise ValueError("--sample-offset must satisfy 0 <= offset < sample_every")
+    selected = []
+    scene_positions = defaultdict(int)
+    for item in items:
+        scene = str(item.get("scene_name", "unknown"))
+        position = scene_positions[scene]
+        scene_positions[scene] += 1
+        frame_index = item.get("frame_index")
+        try:
+            frame_index = int(frame_index)
+        except (TypeError, ValueError):
+            frame_index = position
+        if frame_index >= offset and (frame_index - offset) % every == 0:
+            selected.append(item)
+    return selected
+
+
+def select_point_audit_infos(infos, args):
+    if args.converted_mode == "all":
+        return list(infos)
+    selected = choose_every_n_frames(infos, args.sample_every, args.sample_offset)
+    if args.max_converted_samples_per_split > 0:
+        selected = choose_evenly(selected, args.max_converted_samples_per_split)
+    return selected
 
 
 def resolve_path(root, value):
@@ -180,7 +265,8 @@ def audit_raw(args):
     intensity_values = []
     lidar_count_differences = []
 
-    for scene in sorted(path for path in root.iterdir() if path.is_dir()):
+    scenes = sorted(path for path in root.iterdir() if path.is_dir())
+    for scene in tqdm(scenes, desc="raw scenes", unit="scene", disable=args.no_progress):
         calibration_path = scene / "calibration.json"
         metadata_path = scene / "metadata.json"
         if not calibration_path.is_file() or not metadata_path.is_file():
@@ -195,7 +281,7 @@ def audit_raw(args):
         sampled = choose_evenly(indices, args.max_raw_frames_per_scene)
         scene_counts = Counter()
 
-        for index in sampled:
+        for index in tqdm(sampled, desc="raw {}".format(scene.name), unit="frame", leave=False, disable=args.no_progress):
             stem = "{:06d}".format(index)
             pose = load_json(scene / "pose" / (stem + ".json"))
             label = load_json(scene / "labels" / (stem + ".json"))
@@ -301,21 +387,59 @@ def summarize_records(records):
 def audit_converted(args):
     root = Path(args.converted_root).resolve()
     records = defaultdict(list)
-    report = {"root": str(root), "splits": {}, "point_samples": {}}
+    scene_filters = parse_scene_filters(args.scene)
+    report = {
+        "root": str(root),
+        "selection": {
+            "splits": list(args.splits),
+            "scene_filters": {k: sorted(v) for k, v in scene_filters.items()},
+            "converted_mode": args.converted_mode,
+            "sample_every": args.sample_every if args.converted_mode == "stride" else None,
+            "sample_offset": args.sample_offset if args.converted_mode == "stride" else None,
+            "max_converted_samples_per_split": (
+                args.max_converted_samples_per_split
+                if args.converted_mode == "stride" and args.max_converted_samples_per_split > 0
+                else None
+            ),
+        },
+        "splits": {},
+        "point_samples": {},
+    }
 
-    for split in ("train", "val", "test"):
+    for split in args.splits:
         path = root / ("uavdataset_infos_{}.pkl".format(split))
         if not path.is_file():
+            print("[WARN] missing {}, skip {}".format(path, split))
             continue
         with path.open("rb") as handle:
             data = pickle.load(handle)
-        infos = list(data["infos"])
+        all_infos = list(data["infos"])
+        infos = filter_infos_by_scene(all_infos, split, scene_filters)
+        scenes = sorted({str(info.get("scene_name", "unknown")) for info in infos})
+        point_infos = select_point_audit_infos(infos, args)
+
+        print(
+            "[{}] scope: {} / {} frames, scenes={} | point audit: {} frames ({})".format(
+                split, len(infos), len(all_infos), ",".join(scenes),
+                len(point_infos), args.converted_mode,
+            )
+        )
+
         valid_counts = Counter()
         invalid_counts = Counter()
         scene_counts = defaultdict(Counter)
         empty = 0
         center_outside_range = 0
-        for info in infos:
+
+        # Metadata/GT statistics are cheap: run them on every frame in the
+        # selected split/scene scope. The expensive point-cloud pipeline below
+        # follows --converted-mode / --sample-every.
+        for info in tqdm(
+            infos,
+            desc="{} GT metadata".format(split),
+            unit="frame",
+            disable=args.no_progress,
+        ):
             boxes = np.asarray(info.get("gt_boxes", []), dtype=np.float64).reshape(-1, 7)
             names = np.asarray(info.get("gt_names", []), dtype=object)
             valid = np.asarray(info.get("valid_flag", np.ones(len(boxes), dtype=bool)), dtype=bool)
@@ -334,6 +458,9 @@ def audit_converted(args):
                         not ((box[:3] >= low) & (box[:3] < high)).all()
                     )
         report["splits"][split] = {
+            "samples_in_pkl": len(all_infos),
+            "samples_in_selected_scope": len(infos),
+            "selected_scenes": scenes,
             "samples": len(infos),
             "empty_or_no_valid_gt_samples": empty,
             "valid_class_counts": dict(valid_counts),
@@ -345,7 +472,12 @@ def audit_converted(args):
         }
 
         metrics = defaultdict(list)
-        for info in choose_evenly(infos, args.max_converted_samples_per_split):
+        for info in tqdm(
+            point_infos,
+            desc="{} point audit".format(split),
+            unit="frame",
+            disable=args.no_progress,
+        ):
             points = load_multisweep(info, root, args.sweeps_num)
             current = np.fromfile(
                 resolve_path(root, info["lidar_path"]), dtype=np.float32
@@ -364,8 +496,12 @@ def audit_converted(args):
             )
             metrics["points_before"].append(len(points))
             metrics["frustum_keep_ratio"].append(float(frustum.mean()))
-            metrics["range_keep_ratio_after_frustum"].append(float((frustum & inside_range).sum() / max(frustum.sum(), 1)))
-            metrics["depth_bound_coverage"].append(float((used & depth_ok).sum() / max(used.sum(), 1)))
+            metrics["range_keep_ratio_after_frustum"].append(
+                float((frustum & inside_range).sum() / max(frustum.sum(), 1))
+            )
+            metrics["depth_bound_coverage"].append(
+                float((used & depth_ok).sum() / max(used.sum(), 1))
+            )
             if used.any():
                 used_z = points[used, 2]
                 metrics["point_z_min"].append(float(used_z.min()))
@@ -407,8 +543,13 @@ def audit_converted(args):
                 )
             for key, value in voxels.items():
                 metrics["voxel_" + key].append(value)
+
         report["point_samples"][split] = {
-            "sampled": len(next(iter(metrics.values()), [])),
+            "sampled": len(point_infos),
+            "mode": args.converted_mode,
+            "sample_every": args.sample_every if args.converted_mode == "stride" else None,
+            "sample_offset": args.sample_offset if args.converted_mode == "stride" else None,
+            "selected_scenes": scenes,
             **{key: quantiles(values) for key, values in metrics.items()},
         }
 
@@ -419,6 +560,8 @@ def audit_converted(args):
 def self_check():
     items = list(range(10))
     assert choose_evenly(items, 3) == [0, 4, 9]
+    demo = [{"scene_name": "A", "frame_index": i} for i in range(7)]
+    assert [x["frame_index"] for x in choose_every_n_frames(demo, 3)] == [0, 3, 6]
     points = np.asarray([[0.1, 0.1, 0.1], [0.2, 0.1, 0.1], [1.1, 0.1, 0.1]])
     stats = voxel_stats(points, [0, 0, 0, 2, 2, 2], [1, 1, 1], 1, 10)
     assert stats["voxels"] == 2 and np.isclose(stats["point_drop_ratio"], 1 / 3)
@@ -431,7 +574,45 @@ def build_parser():
     parser.add_argument("--converted-root")
     parser.add_argument("--output", default="uav_audit_report.json")
     parser.add_argument("--max-raw-frames-per-scene", type=int, default=100)
-    parser.add_argument("--max-converted-samples-per-split", type=int, default=100)
+    parser.add_argument(
+        "--splits", nargs="+", choices=("train", "val", "test"),
+        default=["train", "val", "test"],
+        help="Converted splits to inspect.",
+    )
+    parser.add_argument(
+        "--scene", action="append", default=[], metavar="SPLIT:SCENE",
+        help=(
+            "Restrict a split to a scene/subdataset. Repeat as needed, e.g. "
+            "--scene train:Town04_Opt --scene val:Town05_Opt. "
+            "A selected split without --scene keeps all its scenes."
+        ),
+    )
+    parser.add_argument(
+        "--converted-mode", choices=("all", "stride"), default="stride",
+        help=(
+            "all: run the expensive point audit on every frame in scope; "
+            "stride: sample every Nth frame independently per scene."
+        ),
+    )
+    parser.add_argument(
+        "--sample-every", type=int, default=10,
+        help="With --converted-mode stride, audit every Nth frame per scene.",
+    )
+    parser.add_argument(
+        "--sample-offset", type=int, default=0,
+        help="Frame-index offset for stride sampling; must be in [0, N).",
+    )
+    parser.add_argument(
+        "--max-converted-samples-per-split", type=int, default=0,
+        help=(
+            "Optional final cap after stride sampling (0 = no cap). "
+            "Ignored in --converted-mode all."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="Disable tqdm progress bars.",
+    )
     parser.add_argument("--sweeps-num", type=int, default=9)
     parser.add_argument("--point-cloud-range", type=float, nargs=6, default=[-51.2, -51.2, -12.0, 51.2, 51.2, 14.0])
     parser.add_argument("--voxel-size", type=float, nargs=3, default=[0.1, 0.1, 0.2])
@@ -451,6 +632,10 @@ def main():
     if args.self_check:
         self_check()
         return
+    if args.sample_every <= 0:
+        raise SystemExit("--sample-every must be >= 1")
+    if args.sample_offset < 0 or args.sample_offset >= args.sample_every:
+        raise SystemExit("--sample-offset must satisfy 0 <= offset < sample_every")
     if not args.raw_root and not args.converted_root:
         raise SystemExit("Pass --raw-root and/or --converted-root")
     report = {"config": vars(args)}
