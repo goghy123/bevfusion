@@ -231,10 +231,18 @@ class UAVDataset(Custom3DDataset):
         filter_empty_gt=True,
         test_mode=False,
         use_valid_flag=True,
+        point_cloud_range=None,
     ):
         self.load_interval = int(load_interval)
         self.use_valid_flag = bool(use_valid_flag)
         self.with_velocity = bool(with_velocity)
+        self.point_cloud_range = (
+            None
+            if point_cloud_range is None
+            else np.asarray(point_cloud_range, dtype=np.float32)
+        )
+        if self.point_cloud_range is not None and self.point_cloud_range.shape != (6,):
+            raise ValueError("point_cloud_range must contain 6 values")
         self.map_classes = map_classes
         if modality is None:
             modality = dict(
@@ -268,12 +276,35 @@ class UAVDataset(Custom3DDataset):
             return value
         return osp.abspath(osp.join(self.dataset_root, value))
 
+    def _base_gt_mask(self, info):
+        boxes = np.asarray(info["gt_boxes"], dtype=np.float32).reshape(-1, 7)
+        if self.use_valid_flag:
+            mask = np.asarray(info["valid_flag"], dtype=bool).copy()
+        else:
+            mask = np.asarray(info["num_lidar_pts"]) > 0
+
+        # Use the same physical ROI for dataset loading and native evaluation.
+        # ROI membership is defined by GT CENTER XYZ. A box may extend partly
+        # outside the range and still remain a valid target when its center is
+        # inside. Strict bounds match BaseInstance3DBoxes.in_range_3d().
+        if self.point_cloud_range is not None and len(boxes):
+            low = self.point_cloud_range[:3]
+            high = self.point_cloud_range[3:]
+            center_inside = (
+                (boxes[:, 0] > low[0])
+                & (boxes[:, 1] > low[1])
+                & (boxes[:, 2] > low[2])
+                & (boxes[:, 0] < high[0])
+                & (boxes[:, 1] < high[1])
+                & (boxes[:, 2] < high[2])
+            )
+            mask &= center_inside
+        return mask
+
     def get_cat_ids(self, index):
         info = self.data_infos[index]
-        if self.use_valid_flag:
-            names = info["gt_names"][info["valid_flag"]]
-        else:
-            names = info["gt_names"]
+        mask = self._base_gt_mask(info)
+        names = np.asarray(info["gt_names"], dtype=object)[mask]
         return sorted(
             {self.cat2id[str(name)] for name in names if str(name) in self.cat2id}
         )
@@ -336,10 +367,7 @@ class UAVDataset(Custom3DDataset):
 
     def get_ann_info(self, index):
         info = self.data_infos[index]
-        if self.use_valid_flag:
-            mask = np.asarray(info["valid_flag"], dtype=bool)
-        else:
-            mask = np.asarray(info["num_lidar_pts"]) > 0
+        mask = self._base_gt_mask(info)
         gt_boxes = np.asarray(info["gt_boxes"], dtype=np.float32)[mask]
         gt_names = np.asarray(info["gt_names"], dtype=object)[mask]
         gt_labels = np.asarray(
@@ -367,9 +395,8 @@ class UAVDataset(Custom3DDataset):
         gt_by_sample = {}
         class_name = self.CLASSES[class_index]
         for sample_index, info in enumerate(self.data_infos):
-            valid = np.asarray(info["valid_flag"], dtype=bool)
             names = np.asarray(info["gt_names"], dtype=object)
-            mask = valid & (names == class_name)
+            mask = self._base_gt_mask(info) & (names == class_name)
             boxes = np.asarray(info["gt_boxes"], dtype=np.float64)[mask].copy()
             if len(boxes):
                 boxes[:, 2] -= boxes[:, 5] * 0.5

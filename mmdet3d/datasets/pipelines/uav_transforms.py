@@ -212,6 +212,48 @@ class LiDARCameraFrustumFilter:
 
 
 @PIPELINES.register_module()
+class UAVObjectRangeFilter3D:
+    """Filter UAV GT boxes by center XYZ using ``point_cloud_range``.
+
+    The generic ObjectRangeFilter in this BEVFusion fork uses
+    ``in_range_bev`` for LiDAR boxes, so it checks only GT center X/Y.
+    UAV scenes can contain meaningful multi-level Z structure, therefore
+    training GT ROI is defined here by center X/Y/Z using the same physical
+    range as PointsRangeFilter.
+
+    A GT box is kept when its CENTER satisfies strict bounds:
+        xmin < x < xmax
+        ymin < y < ymax
+        zmin < z < zmax
+
+    The whole 3D box is NOT required to fit inside the range.
+    """
+
+    def __init__(self, point_cloud_range):
+        self.pcd_range = np.asarray(point_cloud_range, dtype=np.float32)
+        if self.pcd_range.shape != (6,):
+            raise ValueError("point_cloud_range must contain 6 values")
+
+    def __call__(self, data):
+        gt_bboxes_3d = data["gt_bboxes_3d"]
+        gt_labels_3d = data["gt_labels_3d"]
+
+        mask = gt_bboxes_3d.in_range_3d(self.pcd_range)
+        data["gt_bboxes_3d"] = gt_bboxes_3d[mask]
+        data["gt_labels_3d"] = gt_labels_3d[
+            mask.detach().cpu().numpy().astype(np.bool_)
+        ]
+
+        data["gt_bboxes_3d"].limit_yaw(offset=0.5, period=2 * np.pi)
+        return data
+
+    def __repr__(self):
+        return "{}(point_cloud_range={})".format(
+            self.__class__.__name__, self.pcd_range.tolist()
+        )
+
+
+@PIPELINES.register_module()
 class UAVImageAug3D(ImageAug3D):
     """ImageAug3D with a centered vertical crop for top-down imagery.
 
@@ -284,4 +326,8 @@ class UAVImageAug3D(ImageAug3D):
         )
 
 
-__all__ = ["LiDARCameraFrustumFilter", "UAVImageAug3D"]
+__all__ = [
+    "LiDARCameraFrustumFilter",
+    "UAVObjectRangeFilter3D",
+    "UAVImageAug3D",
+]
