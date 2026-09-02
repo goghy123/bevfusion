@@ -32,7 +32,7 @@ model:
         max_num_points: 10
         point_cloud_range: ${point_cloud_range}
         voxel_size: ${voxel_size}
-        max_voxels: [200000, 205000]
+        max_voxels: [150000, 155000]
       backbone:
         type: SparseEncoder
         in_channels: 5
