@@ -3,7 +3,7 @@ dataset_root: data/uavdataset/
 
 load_dim: 5
 use_dim: 5
-max_sweeps: 6
+max_sweeps: 9
 
 point_cloud_range: [-51.2, -51.2, -12.0, 51.2, 51.2, 14.0]
 voxel_size: [0.1, 0.1, 0.2]
@@ -220,7 +220,7 @@ data:
     type: ${dataset_type}
     dataset_root: ${dataset_root}
     point_cloud_range: ${point_cloud_range}
-    ann_file: ${dataset_root + "uavdataset_infos_train_s6.pkl"}
+    ann_file: ${dataset_root + "uavdataset_infos_train_s9.pkl"}
     pipeline: ${train_pipeline}
     object_classes: ${object_classes}
     modality: ${input_modality}
@@ -233,7 +233,7 @@ data:
     type: ${dataset_type}
     dataset_root: ${dataset_root}
     point_cloud_range: ${point_cloud_range}
-    ann_file: ${dataset_root + "uavdataset_infos_val_s6.pkl"}
+    ann_file: ${dataset_root + "uavdataset_infos_val_s9.pkl"}
     pipeline: ${test_pipeline}
     object_classes: ${object_classes}
     modality: ${input_modality}
@@ -246,7 +246,7 @@ data:
     type: ${dataset_type}
     dataset_root: ${dataset_root}
     point_cloud_range: ${point_cloud_range}
-    ann_file: ${dataset_root + "uavdataset_infos_test_s6.pkl"}
+    ann_file: ${dataset_root + "uavdataset_infos_test_s9.pkl"}
     pipeline: ${test_pipeline}
     object_classes: ${object_classes}
     modality: ${input_modality}
