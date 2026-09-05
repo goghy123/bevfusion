@@ -1,0 +1,53 @@
+version: 1
+
+settings:
+  guard_keyframes: 2
+
+# Final balanced split for the refreshed UAV dataset.
+#
+# IMPORTANT:
+# Town05 normal_val starts at raw frame 0 (not 10) intentionally.
+# Base S9 infos begin at keyframe 10 because the converter drops early
+# keyframes that do not have enough historical sweeps, but keyframe 10/15
+# still reference raw historical frames 1..9.  Assigning 0..755 to Val makes
+# those historical sweeps belong to the same split and avoids artificial
+# cross-split trimming at the beginning of Town05.
+scenes:
+  Town01_Opt:
+    default_split: val
+
+  Town02_Opt:
+    default_split: val
+
+  Town03_Opt:
+    default_split: train
+
+  Town04_Opt:
+    default_split: train
+
+  Town05_Opt:
+    default_split: train
+    ranges:
+      - start: 0
+        end: 755
+        split: val
+        name: normal_val
+
+      - start: 4135
+        end: 4255
+        split: test
+        name: low_z_test
+
+      - start: 4510
+        end: 4630
+        split: val
+        name: low_z_val
+
+  Town06_Opt:
+    default_split: train
+
+  Town07_Opt:
+    default_split: test
+
+  Town10HD_Opt:
+    default_split: test
