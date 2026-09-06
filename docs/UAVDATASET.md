@@ -160,7 +160,7 @@ python tools/rebalance_uav_splits.py \
   --dataset-root data/uavdataset \
   --source-pattern 'uavdataset_infos_{split}.pkl' \
   --plan configs/uavdataset/splits/uav_balanced_split.yaml \
-  --output-dir data/uavdataset/balanced \
+  --output-dir data/uavdataset \
   --sweeps 0 3 6 9 \
   --guard-keyframes 2 \
   --overwrite
@@ -341,6 +341,6 @@ python tools/test.py \
 ```BASH
 python tools/test_uav_predictions.py \
   configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
-  runs/uavdataset-bevfusion-s9/latest.pth \
+  runs/uavdataset-bevfusion-balanced-s9/latest.pth \
   --out-dir runs/uavdataset-bevfusion-s9/test_predictions
 ```
