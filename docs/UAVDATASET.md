@@ -344,3 +344,86 @@ python tools/test_uav_predictions.py \
   runs/uavdataset-bevfusion-balanced-s9/latest.pth \
   --out-dir runs/uavdataset-bevfusion-s9/test_predictions
 ```
+
+## 9.补充
+
+> 这里主要用于修改雷达分支对z轴信息压缩的问题：
+
+v1.0.0因为扩增了point_cloud_range，导致体素卷积池化操作后，生成的2Dbev特征图按z轴的分布有7层，而原项目只有两层，因此carla分支v1.0.0在7层输入后加入一层最大池化层，将7层输入经过固定的卷积池化（最大池化）输出2层，以匹配原项目的融合器输入要求。
+
+V1.1.0保留最大池化层，并新增将7层输出直接接到融合器输入的选项，但是融合器预训练参数不匹配，为此需要初始化融合器参数。
+
+修改`tools/filter_uav_pretrained.py`，支持“保留融合器 / 丢弃融合器 / 在恢复 dbound=60 后保留相机深度预测最后一层”。
+
+### 处理预训练权重
+
+保留因对原项目 D=2 的兼容所新增的最大池化层，同时继续继承原 BEVFusion 融合器，用于保持当前训练方式
+```bash
+python tools/filter_uav_pretrained.py \
+  pretrained/bevfusion-det.pth \
+  pretrained/bevfusion-uav-d2-noinit.pth
+```
+
+使用新的 D=7；因为融合器输入从 336 变成 976，所以整个融合器从零初始化
+```bash
+python tools/filter_uav_pretrained.py \
+  pretrained/bevfusion-det.pth \
+  pretrained/bevfusion-uav-d7-initfuser.pth \
+  --drop-fuser
+```
+
+仍然使用 D=2，但主动让融合器从零初始化；主要用于需要时排除融合器预训练带来的影响
+```bash
+python tools/filter_uav_pretrained.py \
+  pretrained/bevfusion-det.pth \
+  pretrained/bevfusion-uav-d2-initfuser.pth \
+  --drop-fuser
+```
+
+### 训练
+
+```bash
+mkdir -p runs/uav-d7-initfuser-epoch40
+
+torchpack dist-run -np 1 python tools/train.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser_d7_epoch40.yaml \
+  --run-dir runs/uav-d7-initfuser-epoch40 \
+  --load_from pretrained/bevfusion-uav-d7-initfuser.pth \
+  --data.workers_per_gpu 4 \
+  2>&1 | tee runs/uav-d7-initfuser-epoch40/train_log.txt
+```
+
+### 评估
+
+```bash
+python tools/test.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser_d7.yaml \
+  runs/uav-d7-initfuser/latest.pth \
+  --out runs/uav-d7-initfuser/test_results.pkl \
+  --eval bbox \
+  2>&1 | tee runs/uav-d7-initfuser/test_log.txt
+```
+
+### 保存结果评估
+
+保存测试json结果，用于可视化：
+
+```BASH
+python tools/test_uav_predictions.py \
+  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser_d7.yaml \
+  runs/uav-d7-initfuser/latest.pth \
+  --out-dir runs/uav-d7-initfuser/test_predictions
+```
+
+相机 dbound=70：configs/uavdataset/det/transfusion/secfpn/camera+lidar/default.yaml：dbound: [1.0, 60.0, 0.5]
+把 dbound 改回 60，那么刚才任意一个过滤命令后面加：--keep-depthnet-final即可。
+
+例如 D=7：
+
+```bash
+python tools/filter_uav_pretrained.py \
+  pretrained/bevfusion-det.pth \
+  pretrained/bevfusion-uav-d7-init.pth \
+  --drop-fuser \
+  --keep-depthnet-final
+```
