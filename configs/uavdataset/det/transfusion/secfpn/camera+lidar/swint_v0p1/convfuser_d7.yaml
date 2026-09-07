@@ -1,0 +1,18 @@
+# D=7 版本：保留现有 convfuser.yaml 不变，单独作为新的训练配置入口。
+# 目的：
+# 1. 取消 UAV 分支后来增加的 vertical_pool_size=2 最大池化；
+# 2. 保留 SparseEncoder 自然输出的 D=7；
+# 3. 因此 LiDAR BEV 通道从 128*2=256 变为 128*7=896；
+# 4. 相机仍为 80 通道，所以 ConvFuser 输入改为 [80, 896]；
+# 5. ConvFuser 输出仍保持 256，从而 SECOND / FPN / TransFusion 后续结构全部不变。
+
+model:
+  encoders:
+    lidar:
+      backbone:
+        vertical_pool_size: null
+
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 896]
+    out_channels: 256
