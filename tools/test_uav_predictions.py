@@ -166,11 +166,23 @@ def _export_result(result, info, sample_index, class_names, inference_ms, output
     return str(relative_path.as_posix()), token, scene_name, frame_index, len(detections)
 
 
-def _build_test_components(args):
+def _build_test_components(args, split="test"):
     configs.load(args.config, recursive=True)
     cfg = Config(recursive_eval(configs), filename=args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+
+    if split not in {"train", "val", "test"}:
+        raise ValueError("split must be train, val, or test")
+    if split != "test":
+        split_cfg = cfg.data.get(split)
+        if not isinstance(split_cfg, dict):
+            raise ValueError("data.{} must be a dataset config dictionary".format(split))
+        split_cfg = split_cfg.copy()
+        if split == "train":
+            # Evaluate the train annotations without random train-time augmentation.
+            split_cfg.pipeline = cfg.data.val.get("pipeline", cfg.data.test.pipeline)
+        cfg.data.test = split_cfg
 
     if cfg.get("cudnn_benchmark", False):
         torch.backends.cudnn.benchmark = True

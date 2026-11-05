@@ -36,6 +36,9 @@ except ModuleNotFoundError as error:
         "pair_iou",
         "interpolated_ap",
         "match_predictions",
+        "z_threshold_ap",
+        "matched_z_errors",
+        "z_error_summary",
     }
     metric_tree = ast.Module(
         body=[
@@ -57,6 +60,9 @@ except ModuleNotFoundError as error:
     interpolated_ap = namespace["interpolated_ap"]
     match_predictions = namespace["match_predictions"]
     pair_iou = namespace["pair_iou"]
+    z_threshold_ap = namespace["z_threshold_ap"]
+    matched_z_errors = namespace["matched_z_errors"]
+    z_error_summary = namespace["z_error_summary"]
 
 
 class UAVMetricTest(unittest.TestCase):
@@ -88,6 +94,26 @@ class UAVMetricTest(unittest.TestCase):
             np.cumsum(true_positive) + np.cumsum(false_positive)
         )
         self.assertAlmostEqual(interpolated_ap(recall, precision), 1.0)
+
+    def test_z_error_and_z_threshold_ap(self):
+        gt = np.asarray([0.0, 0.0, -1.0, 2.0, 4.0, 2.0, 0.0])
+        wrong_z = gt.copy()
+        wrong_z[2] += 1.0
+        right_z = gt.copy()
+        right_z[2] += 0.4
+        predictions = [(0.9, 0, wrong_z), (0.8, 0, right_z)]
+        gt_by_sample = {0: np.asarray([gt])}
+
+        self.assertAlmostEqual(
+            z_threshold_ap(predictions, gt_by_sample, 0.5, 0.5), 0.5
+        )
+        self.assertAlmostEqual(
+            z_threshold_ap(predictions, gt_by_sample, 0.5, 1.1), 1.0
+        )
+        errors = matched_z_errors([(0.8, 0, right_z)], gt_by_sample, 0.5)
+        np.testing.assert_allclose(errors, [0.4])
+        self.assertAlmostEqual(z_error_summary(errors)["mae_m"], 0.4)
+        self.assertIsNone(z_error_summary([])["mae_m"])
 
 
 if __name__ == "__main__":

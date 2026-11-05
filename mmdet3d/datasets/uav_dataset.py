@@ -211,6 +211,95 @@ def match_predictions(
     return true_positive, false_positive, num_gt
 
 
+def z_threshold_ap(predictions, gt_by_sample, iou_threshold, z_threshold):
+    """AP with BEV IoU and center-height error as joint match criteria."""
+    ordered = sorted(predictions, key=lambda item: item[0], reverse=True)
+    matched = {
+        sample_index: np.zeros(len(boxes), dtype=bool)
+        for sample_index, boxes in gt_by_sample.items()
+    }
+    true_positive = np.zeros(len(ordered), dtype=np.float64)
+    false_positive = np.zeros(len(ordered), dtype=np.float64)
+    for prediction_index, (_, sample_index, prediction_box) in enumerate(ordered):
+        gt_boxes = gt_by_sample.get(sample_index)
+        if gt_boxes is None or len(gt_boxes) == 0:
+            false_positive[prediction_index] = 1.0
+            continue
+        candidates = [
+            gt_index
+            for gt_index, gt_box in enumerate(gt_boxes)
+            if not matched[sample_index][gt_index]
+            and abs(
+                (prediction_box[2] + prediction_box[5] * 0.5)
+                - (gt_box[2] + gt_box[5] * 0.5)
+            ) <= z_threshold
+        ]
+        ious = np.asarray(
+            [pair_iou(prediction_box, gt_boxes[index], "bev") for index in candidates]
+        )
+        if len(ious) and float(np.max(ious)) >= iou_threshold:
+            best_index = candidates[int(np.argmax(ious))]
+            matched[sample_index][best_index] = True
+            true_positive[prediction_index] = 1.0
+        else:
+            false_positive[prediction_index] = 1.0
+    num_gt = int(sum(len(boxes) for boxes in gt_by_sample.values()))
+    if num_gt == 0:
+        return 0.0
+    recalls = np.cumsum(true_positive) / num_gt
+    precisions = np.cumsum(true_positive) / np.maximum(
+        np.cumsum(true_positive) + np.cumsum(false_positive), 1e-12
+    )
+    return interpolated_ap(recalls, precisions)
+
+
+def matched_z_errors(predictions, gt_by_sample, iou_threshold, score_threshold=0.1):
+    ordered = sorted(
+        (item for item in predictions if item[0] >= score_threshold),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    matched = {
+        sample_index: np.zeros(len(boxes), dtype=bool)
+        for sample_index, boxes in gt_by_sample.items()
+    }
+    errors = []
+    for _, sample_index, prediction_box in ordered:
+        gt_boxes = gt_by_sample.get(sample_index)
+        if gt_boxes is None or len(gt_boxes) == 0:
+            continue
+        ious = np.asarray(
+            [pair_iou(prediction_box, gt_box, "bev") for gt_box in gt_boxes]
+        )
+        ious[matched[sample_index]] = -1.0
+        best_index = int(np.argmax(ious))
+        if ious[best_index] >= iou_threshold:
+            matched[sample_index][best_index] = True
+            errors.append(
+                float(
+                    (prediction_box[2] + prediction_box[5] * 0.5)
+                    - (gt_boxes[best_index, 2] + gt_boxes[best_index, 5] * 0.5)
+                )
+            )
+    return errors
+
+
+def z_error_summary(errors):
+    errors = np.asarray(errors, dtype=np.float64)
+    if not len(errors):
+        return {"matches": 0, "mae_m": None, "rmse_m": None, "bias_m": None,
+                "p50_abs_m": None, "p90_abs_m": None}
+    absolute = np.abs(errors)
+    return {
+        "matches": int(len(errors)),
+        "mae_m": float(np.mean(absolute)),
+        "rmse_m": float(np.sqrt(np.mean(errors ** 2))),
+        "bias_m": float(np.mean(errors)),
+        "p50_abs_m": float(np.percentile(absolute, 50)),
+        "p90_abs_m": float(np.percentile(absolute, 90)),
+    }
+
+
 @DATASETS.register_module()
 class UAVDataset(Custom3DDataset):
     """Single-camera UAV Camera+LiDAR dataset produced by the UAV converter."""
