@@ -837,6 +837,7 @@ def audit_gt(
         empty_valid = 0
         range_counts = Counter()
         total_valid = 0
+        frame_profiles = defaultdict(list)
 
         for info in tqdm(infos, desc="GT {}".format(split), unit="frame"):
             boxes = np.asarray(info.get("gt_boxes", []), dtype=np.float64).reshape(-1, 7)
@@ -870,6 +871,15 @@ def audit_gt(
             range_counts["box_fully_outside"] += int(masks["fully_outside"].sum())
 
             scene = str(info.get("scene_name", "unknown"))
+            roi_boxes = valid_boxes[masks["center_inside"]]
+            roi_names = valid_names[masks["center_inside"]]
+            frame_profiles[scene].append({
+                "frame_index": int(info["frame_index"]),
+                "route_distance_m": info.get("route_distance_m"),
+                "altitude_above_road_m": info.get("altitude_above_road_m"),
+                "class_counts_in_roi": dict(Counter(map(str, roi_names))),
+                "center_z_in_roi": roi_boxes[:, 2].tolist(),
+            })
             for box, raw_name, lidar_points in zip(valid_boxes, valid_names, valid_lidar):
                 name = str(raw_name)
                 if classes and name not in classes:
@@ -897,6 +907,7 @@ def audit_gt(
 
         report["splits"][split] = {
             "frames": len(infos),
+            "frame_profiles_by_scene": dict(frame_profiles),
             "empty_or_no_valid_gt_frames": int(empty_valid),
             "valid_gt": int(total_valid),
             "valid_class_counts": dict(valid_class_counts),

@@ -266,10 +266,17 @@ def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
     }
 
 
-def reference_height_m(pose: dict, altitude_m: float) -> float:
+def reference_height_m(pose: dict) -> float:
     uav_z = float(pose["uav"]["location"]["z"])
     lidar_z = float(pose["lidar"]["location"]["z"])
-    route_ground_z = uav_z - float(altitude_m)
+    route_ground_z = float(pose["road_z_m"])
+    altitude_m = float(pose["altitude_above_road_m"])
+    if not np.isfinite([uav_z, lidar_z, route_ground_z, altitude_m]).all():
+        raise ValueError("Non-finite per-frame UAV/LiDAR height")
+    if altitude_m <= 0 or lidar_z <= route_ground_z:
+        raise ValueError("UAV and LiDAR must be above route ground")
+    if not math.isclose(uav_z - route_ground_z, altitude_m, abs_tol=0.01):
+        raise ValueError("Per-frame road_z_m and altitude_above_road_m disagree")
     return lidar_z - route_ground_z
 
 
@@ -693,10 +700,9 @@ def convert_dataset(args: argparse.Namespace) -> dict:
         files = inspected["files"]
         metadata = inspected["metadata"]
         calibration = inspected["calibration"]
-        altitude_m = float(metadata["uav_altitude_above_road_m"])
         poses = {index: load_json(files["pose"][index]) for index in indices}
         heights = {
-            index: reference_height_m(poses[index], altitude_m) for index in indices
+            index: reference_height_m(poses[index]) for index in indices
         }
         world_references = {
             index: world_reference_transform(poses[index], heights[index])
@@ -836,6 +842,12 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                 ),
             }
             info.update(annotations)
+            for key in (
+                "road_z_m", "altitude_above_road_m", "route_distance_m",
+                "route_progress", "dataset_time_s", "motion_time_s",
+                "is_hovering", "hover_index", "uav_effective_speed_mps",
+            ):
+                info[key] = pose[key]
             infos_by_split[split_name].append(info)
             kept_keyframes.append(frame_index)
 
