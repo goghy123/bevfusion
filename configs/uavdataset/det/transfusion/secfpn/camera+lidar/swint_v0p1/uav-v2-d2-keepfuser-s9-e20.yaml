@@ -1,0 +1,22 @@
+# D=2：保留融合器预训练权重。
+dataset_root: data/uavdataset_v2/
+
+load_from: pretrained/bevfusion-uav-v2-d2-keepfuser.pth
+
+data:
+  workers_per_gpu: 4
+
+model:
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 256]
+    out_channels: 256
+
+  heads:
+    object:
+      bbox_coder:
+        post_center_range: ${point_cloud_range}
+
+evaluation:
+  save_best: uav/3D_mAP@0.50
+  rule: greater

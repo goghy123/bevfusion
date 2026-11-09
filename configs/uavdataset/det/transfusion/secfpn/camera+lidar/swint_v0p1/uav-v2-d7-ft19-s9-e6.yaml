@@ -1,0 +1,36 @@
+# D=7：完整加载第 19 轮模型，重新建立优化器后微调。
+dataset_root: data/uavdataset_v2/
+
+load_from: runs/uav-v2-d7-s9-e20/epoch_19.pth
+
+max_epochs: 6
+
+data:
+  workers_per_gpu: 4
+
+model:
+  encoders:
+    lidar:
+      backbone:
+        vertical_pool_size: null
+
+  fuser:
+    type: ConvFuser
+    in_channels: [80, 896]
+    out_channels: 256
+
+  heads:
+    object:
+      bbox_coder:
+        post_center_range: ${point_cloud_range}
+
+optimizer:
+  lr: 1.0e-5
+
+lr_config:
+  warmup_iters: 200
+  min_lr_ratio: 0.1
+
+evaluation:
+  save_best: uav/3D_mAP@0.50
+  rule: greater
