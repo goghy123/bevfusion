@@ -120,6 +120,9 @@ def discover_scenes(root_path: Path) -> List[Path]:
     for candidate in sorted(path for path in root_path.iterdir() if path.is_dir()):
         if all((candidate / item).exists() for item in REQUIRED_SCENE_ITEMS):
             scenes.append(candidate)
+        else:
+            scenes.extend(run for run in sorted(candidate.glob("run_*")) if run.is_dir()
+                          and all((run / item).exists() for item in REQUIRED_SCENE_ITEMS))
     if not scenes:
         raise RuntimeError(
             "No scene directories found below {}. A scene must contain: {}".format(
@@ -149,7 +152,7 @@ def inspect_scene_files(scene_dir: Path, allow_partial: bool) -> dict:
     }
     metadata = load_json(scene_dir / "metadata.json")
     expected = int(metadata.get("actual_num_frames", len(common)))
-    incomplete = bool(mismatches) or len(common) != expected
+    incomplete = bool(mismatches) or len(common) != expected or metadata.get("recording_complete") is False
     if incomplete and not allow_partial:
         summary = {name: len(values) for name, values in maps.items()}
         raise RuntimeError(
@@ -173,7 +176,7 @@ def inspect_scene_files(scene_dir: Path, allow_partial: bool) -> dict:
     }
 
 
-def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
+def load_split_config(split_file: Path, scene_names: Sequence[str], scene_maps=None) -> dict:
     """Load and validate an explicit scene-level train/val/test assignment.
 
     YAML format::
@@ -200,6 +203,14 @@ def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
     splits = data.get("splits")
     if not isinstance(splits, dict):
         raise ValueError("Split YAML must contain a 'splits' mapping")
+    if data.get("group_by") == "map":
+        if scene_maps is None:
+            raise ValueError("Map grouping requires recording metadata")
+        requested = [town for values in splits.values() for town in values]
+        if len(requested) != len(set(requested)):
+            raise ValueError("A map may appear in only one split")
+        splits = {name: [scene for scene in scene_names if scene_maps[scene] in towns]
+                  for name, towns in splits.items()}
 
     missing_keys = [name for name in SPLIT_NAMES if name not in splits]
     extra_keys = [name for name in splits if name not in SPLIT_NAMES]
@@ -217,9 +228,6 @@ def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
         values = splits[split_name]
         if not isinstance(values, list):
             raise ValueError("splits.{} must be a YAML list".format(split_name))
-        if not values:
-            raise ValueError("splits.{} must contain at least one scene".format(split_name))
-
         normalized[split_name] = []
         for value in values:
             if not isinstance(value, str) or not value.strip():
@@ -229,7 +237,7 @@ def load_split_config(split_file: Path, scene_names: Sequence[str]) -> dict:
                     )
                 )
             scene_name = value.strip()
-            if Path(scene_name).name != scene_name:
+            if Path(scene_name).is_absolute() or ".." in scene_name.replace("\\", "/").split("/"):
                 raise ValueError(
                     "Scene names in split YAML must be directory basenames, got: {}".format(
                         scene_name
@@ -282,13 +290,17 @@ def reference_height_m(pose: dict) -> float:
 
 def world_reference_transform(pose: dict, height_m: float) -> np.ndarray:
     world_lhs_from_lidar_lhs = np.asarray(pose["T_world_lidar"], dtype=np.float64)
-    world_rhs_from_lidar_rhs = S4 @ world_lhs_from_lidar_lhs @ S4
-    if abs(float(world_rhs_from_lidar_rhs[2, 2])) < 0.999:
-        raise RuntimeError(
-            "Ground-referenced conversion requires a level LiDAR (roll/pitch near zero)"
-        )
-    lidar_rhs_from_reference_rhs = homogeneous(translation=[0.0, 0.0, -height_m])
-    return world_rhs_from_lidar_rhs @ lidar_rhs_from_reference_rhs
+    yaw = math.radians(float(pose.get("base_yaw_deg", pose["lidar"].get("rotation", {}).get("yaw", 0.0))))
+    if "base_yaw_deg" not in pose:
+        yaw = math.atan2(world_lhs_from_lidar_lhs[1, 0], world_lhs_from_lidar_lhs[0, 0])
+    c, s = math.cos(yaw), math.sin(yaw)
+    world_lhs_from_reference_lhs = homogeneous([[c, -s, 0], [s, c, 0], [0, 0, 1]],
+        [world_lhs_from_lidar_lhs[0, 3], world_lhs_from_lidar_lhs[1, 3], float(pose["road_z_m"])])
+    return S4 @ world_lhs_from_reference_lhs @ S4
+
+
+def reference_from_raw_lidar(pose, world_reference):
+    return np.linalg.inv(world_reference) @ S4 @ np.asarray(pose["T_world_lidar"], dtype=np.float64)
 
 
 def camera_to_reference_transform(
@@ -305,7 +317,8 @@ def camera_to_reference_transform(
 
 
 def convert_points(
-    source_path: Path, output_path: Path, height_m: float, intensity_scale: float
+    source_path: Path, output_path: Path, height_m: float, intensity_scale: float,
+    reference_from_raw=None,
 ) -> dict:
     flat = np.fromfile(str(source_path), dtype=np.float32)
     if flat.size % 4 != 0:
@@ -319,6 +332,8 @@ def convert_points(
     converted[:, 0] = raw[:, 0]
     converted[:, 1] = -raw[:, 1]
     converted[:, 2] = raw[:, 2] + float(height_m)
+    if reference_from_raw is not None:
+        converted[:, :3] = raw[:, :3] @ reference_from_raw[:3, :3].T + reference_from_raw[:3, 3]
     converted[:, 3] = raw[:, 3] * float(intensity_scale)
     converted[:, 4] = 0.0
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,11 +445,13 @@ def convert_annotations(
     world_rhs_from_reference: np.ndarray,
     tracks: Dict[Tuple[str, int], List[Tuple[float, np.ndarray]]],
     max_velocity_gap_s: float,
+    reference_from_raw=None,
 ) -> Tuple[dict, Counter]:
     gt_boxes = []
     gt_names = []
     gt_velocity = []
     num_lidar_pts = []
+    gt_tilt_deg = []
     class_counts = Counter()
     reference_from_world_rhs = np.linalg.inv(world_rhs_from_reference)
 
@@ -451,6 +468,11 @@ def convert_annotations(
             lidar_bbox["orientation_matrix"], dtype=np.float64
         )
         forward_reference = S3 @ orientation_lhs[:, 0]
+        if reference_from_raw is not None:
+            center_reference = reference_from_raw[:3, :3] @ center_lhs + reference_from_raw[:3, 3]
+            forward_reference = reference_from_raw[:3, :3] @ orientation_lhs[:, 0]
+        up = (reference_from_raw[:3, :3] if reference_from_raw is not None else S3) @ orientation_lhs[:, 2]
+        gt_tilt_deg.append(math.degrees(math.acos(float(np.clip(abs(up[2]), 0.0, 1.0)))))
         heading = math.atan2(float(forward_reference[1]), float(forward_reference[0]))
         bevfusion_yaw = normalize_angle(-heading - math.pi / 2.0)
 
@@ -489,6 +511,7 @@ def convert_annotations(
         "gt_boxes": boxes_array,
         "gt_names": names_array,
         "gt_velocity": velocities_array,
+        "gt_tilt_deg": np.asarray(gt_tilt_deg, dtype=np.float32),
         "num_lidar_pts": lidar_counts,
         "num_radar_pts": np.zeros(len(boxes_array), dtype=np.int64),
         "valid_flag": lidar_counts > 0,
@@ -513,6 +536,7 @@ def build_sweep(
         "data_path": portable_path(point_path, output_root),
         "type": "lidar",
         "sample_data_token": "{}/{:06d}".format(scene_name, frame_index),
+        "world_xy_m": [float(world_rhs_from_previous_reference[0, 3]), -float(world_rhs_from_previous_reference[1, 3])],
         "sensor2ego_translation": [0.0, 0.0, 0.0],
         "sensor2ego_rotation": [1.0, 0.0, 0.0, 0.0],
         "ego2global_translation": world_rhs_from_previous_reference[:3, 3].tolist(),
@@ -652,7 +676,8 @@ def convert_dataset(args: argparse.Namespace) -> dict:
     output_root = Path(args.out_dir).expanduser().resolve()
     scenes = discover_scenes(raw_root)
     split_config = load_split_config(
-        Path(args.split_file), [scene_dir.name for scene_dir in scenes]
+        Path(args.split_file), [scene_dir.relative_to(raw_root).as_posix() for scene_dir in scenes],
+        {scene_dir.relative_to(raw_root).as_posix(): load_json(scene_dir / "metadata.json").get("route_map") for scene_dir in scenes},
     )
     scene_to_split = split_config["scene_to_split"]
     output_root.mkdir(parents=True, exist_ok=True)
@@ -694,7 +719,7 @@ def convert_dataset(args: argparse.Namespace) -> dict:
     }
 
     for scene_dir in scenes:
-        scene_name = scene_dir.name
+        scene_name = scene_dir.relative_to(raw_root).as_posix()
         inspected = inspect_scene_files(scene_dir, args.allow_partial_scenes)
         indices = inspected["indices"]
         files = inspected["files"]
@@ -708,6 +733,20 @@ def convert_dataset(args: argparse.Namespace) -> dict:
             index: world_reference_transform(poses[index], heights[index])
             for index in indices
         }
+        references_from_raw = {index: reference_from_raw_lidar(poses[index], world_references[index]) for index in indices}
+        temporal_scenes = {}
+        scene_index_path = scene_dir / "scenes.json"
+        if scene_index_path.exists():
+            for segment in load_json(scene_index_path)["scenes"]:
+                start, end = int(segment["start_frame"]), int(segment["end_frame_exclusive"])
+                if start < 0 or end <= start:
+                    raise ValueError("Invalid temporal scene range")
+                for index in range(start, end):
+                    if index in temporal_scenes:
+                        raise ValueError("Overlapping temporal scenes")
+                    temporal_scenes[index] = segment["scene_id"]
+            if not set(indices).issubset(temporal_scenes):
+                raise ValueError("scenes.json does not cover every raw frame")
 
         points_dir = output_root / "points" / scene_name
         point_reports = []
@@ -719,6 +758,7 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                     output_point_path,
                     heights[frame_index],
                     args.intensity_scale,
+                    references_from_raw[frame_index],
                 )
             )
         if not all(item["finite"] for item in point_reports):
@@ -744,6 +784,10 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                     max(0, position - args.max_sweeps) : position
                 ]
             else:
+                previous_indices = []
+            previous_indices = [index for index in previous_indices
+                                if temporal_scenes.get(index) == temporal_scenes.get(frame_index)]
+            if previous_indices and previous_indices != list(range(frame_index-args.max_sweeps, frame_index)):
                 previous_indices = []
             if len(previous_indices) < args.max_sweeps:
                 dropped_keyframes.append(frame_index)
@@ -772,6 +816,7 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                 world_reference,
                 tracks,
                 args.max_velocity_gap_s,
+                references_from_raw[frame_index],
             )
             scene_class_counts.update(class_counts)
 
@@ -825,6 +870,12 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                 "token": "{}/{:06d}".format(scene_name, frame_index),
                 "scene_name": scene_name,
                 "frame_index": int(frame_index),
+                "run_key": scene_name,
+                "world_xy_m": [float(world_reference[0, 3]), -float(world_reference[1, 3])],
+                "run_id": metadata.get("run_id"),
+                "weather": metadata.get("weather", "unknown"),
+                "temporal_scene_id": temporal_scenes.get(frame_index),
+                "raw_lidar_from_reference": np.linalg.inv(references_from_raw[frame_index]).tolist(),
                 "split": split_name,
                 "sweeps": sweeps,
                 "cams": {"CAM_DOWN": camera_info},
@@ -842,6 +893,9 @@ def convert_dataset(args: argparse.Namespace) -> dict:
                 ),
             }
             info.update(annotations)
+            for key in ("motion_state", "speed_stage", "attitude_disturbance", "base_yaw_deg", "uav_acceleration_mps2"):
+                if key in pose:
+                    info[key] = pose[key]
             for key in (
                 "road_z_m", "altitude_above_road_m", "route_distance_m",
                 "route_progress", "dataset_time_s", "motion_time_s",
@@ -882,6 +936,8 @@ def convert_dataset(args: argparse.Namespace) -> dict:
         )
         projection = projection_audit(first_info, output_root) if first_info else None
         report["scenes"][scene_name] = {
+            "max_keyframe_gt_tilt_deg": max((float(np.max(info["gt_tilt_deg"])) for info in infos_by_split[split_name]
+                                              if info["scene_name"] == scene_name and len(info["gt_tilt_deg"])), default=0.0),
             "raw_frames": len(indices),
             "metadata_expected_frames": int(
                 metadata.get("actual_num_frames", len(indices))

@@ -598,11 +598,8 @@ def audit_raw_labels(raw_root: Path, classes: Sequence[str]) -> dict:
     if not root.is_dir():
         raise FileNotFoundError("Raw root does not exist: {}".format(root))
 
-    scenes = [
-        p
-        for p in sorted(root.iterdir())
-        if p.is_dir() and (p / "labels").is_dir()
-    ]
+    scenes = sorted({p.parent for p in root.glob("*/labels") if p.is_dir()} |
+                    {p.parent for p in root.glob("*/run_*/labels") if p.is_dir()})
     report = {
         "root": str(root),
         "scene_count": len(scenes),
@@ -625,7 +622,7 @@ def audit_raw_labels(raw_root: Path, classes: Sequence[str]) -> dict:
         scene_lidar: List[float] = []
         scene_rgb: List[float] = []
 
-        for path in tqdm(label_files, desc="raw {}".format(scene.name), unit="frame"):
+        for path in tqdm(label_files, desc="raw {}".format(scene.relative_to(root)), unit="frame"):
             data = load_json(path)
             stats = data.get("annotation_stats", {})
             for key, value in stats.items():
@@ -658,7 +655,7 @@ def audit_raw_labels(raw_root: Path, classes: Sequence[str]) -> dict:
                 "annotations": raw_meta.get("annotations"),
             }
 
-        report["scenes"][scene.name] = {
+        report["scenes"][scene.relative_to(root).as_posix()] = {
             "frames": len(label_files),
             "metadata": metadata,
             "annotation_stats_totals": dict(scene_stats),

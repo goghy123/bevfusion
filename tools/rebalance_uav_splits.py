@@ -118,9 +118,14 @@ class SplitPlan:
             raise ValueError("Only plan version=1 is supported.")
 
         self.settings = dict(raw.get("settings", {}))
+        self.spatial_maps = dict(raw.get("spatial_maps", {}))
+        self.frame_splits = {}
+        self.excluded = set()
         scenes = raw.get("scenes")
-        if not isinstance(scenes, Mapping) or not scenes:
-            raise ValueError("Plan must contain a non-empty 'scenes' mapping.")
+        if self.spatial_maps and not scenes:
+            scenes = {}
+        elif not isinstance(scenes, Mapping) or not scenes:
+            raise ValueError("Plan must contain scenes or spatial_maps")
 
         self.scenes: Dict[str, dict] = {}
         for scene_name, spec in scenes.items():
@@ -166,6 +171,8 @@ class SplitPlan:
         return cls(raw)
 
     def split_for(self, scene_name: str, frame_index: int) -> str:
+        if self.spatial_maps:
+            return self.frame_splits[(scene_name, int(frame_index))]
         if scene_name not in self.scenes:
             raise KeyError(f"Scene {scene_name!r} missing from plan.")
         spec = self.scenes[scene_name]
@@ -180,7 +187,56 @@ class SplitPlan:
             "version": 1,
             "settings": copy.deepcopy(self.settings),
             "scenes": copy.deepcopy(self.scenes),
+            "spatial_maps": copy.deepcopy(self.spatial_maps),
         }
+
+    def bind_spatial(self, infos):
+        """Apply the same CARLA world-XY regions to every weather/run of a map."""
+        points = {}
+        for info in infos:
+            for item in [info] + list(info.get("sweeps", [])):
+                scene, frame = (str(info["scene_name"]), int(info["frame_index"])) if item is info else sweep_scene_frame(item)
+                xy = item.get("world_xy_m")
+                if xy is None or len(xy) != 2 or not np.isfinite(xy).all():
+                    raise ValueError("Spatial splitting requires v3 world_xy_m for keyframes and sweeps")
+                points[(scene, frame)] = (str(info["location"]), xy)
+        for key, (town, (x, y)) in points.items():
+            if town not in self.spatial_maps:
+                raise ValueError(f"Map {town} missing from spatial_maps")
+            spec = self.spatial_maps[town]
+            split = normalize_split(spec.get("default_split", "train"))
+            buffer = float(spec.get("buffer_m", 110.0))
+            if not math.isfinite(buffer) or buffer < 0:
+                raise ValueError("buffer_m must be finite and non-negative")
+            inside, near = [], []
+            for region in spec.get("regions", []):
+                xmin, ymin, xmax, ymax = map(float, region["bounds_xy"])
+                if not np.isfinite([xmin, ymin, xmax, ymax]).all() or xmin >= xmax or ymin >= ymax:
+                    raise ValueError("Invalid region bounds_xy")
+                label = normalize_split(region["split"])
+                if xmin <= x <= xmax and ymin <= y <= ymax:
+                    inside.append(label)
+                    if min(x-xmin, xmax-x, y-ymin, ymax-y) < buffer:
+                        self.excluded.add(key)
+                elif xmin-buffer <= x <= xmax+buffer and ymin-buffer <= y <= ymax+buffer:
+                    near.append(label)
+            if len(inside) > 1:
+                raise ValueError(f"Overlapping spatial regions at {key}")
+            if inside:
+                split = inside[0]
+            if any(label != split for label in near):
+                self.excluded.add(key)
+            self.frame_splits[key] = split
+        segments = defaultdict(list)
+        for info in infos:
+            segment = info.get("temporal_scene_id")
+            if segment is not None:
+                segments[(info["scene_name"], segment)].append(info)
+        for group in segments.values():
+            keys = {(str(info["scene_name"]), int(info["frame_index"])) for info in group}
+            keys.update(sweep_scene_frame(sweep) for info in group for sweep in info.get("sweeps", []))
+            if len({self.frame_splits[key] for key in keys}) > 1 or any(key in self.excluded for key in keys):
+                self.excluded.update(keys)
 
 
 def combine_sources(
@@ -226,6 +282,9 @@ def combine_sources(
 
 
 def validate_scene_coverage(plan: SplitPlan, infos: Sequence[dict]) -> None:
+    if plan.spatial_maps:
+        plan.bind_spatial(infos)
+        return
     dataset_scenes = sorted({str(x["scene_name"]) for x in infos})
     plan_scenes = sorted(plan.scenes)
     if dataset_scenes != plan_scenes:
@@ -239,7 +298,7 @@ def parse_scene_frame(token: Any) -> Tuple[Optional[str], Optional[int]]:
     if token is None:
         return None, None
     text = str(token).replace("\\", "/")
-    m = re.search(r"(Town[^/]+)/(\d+)(?:/[^/]+)?$", text)
+    m = re.search(r"(Town[^/]+(?:/run_\d+)?)/(\d+)(?:/[^/]+)?$", text)
     if m:
         return m.group(1), int(m.group(2))
     return None, None
@@ -251,7 +310,7 @@ def sweep_scene_frame(sweep: Mapping[str, Any]) -> Tuple[str, int]:
         return scene, frame
 
     path = str(sweep.get("data_path", "")).replace("\\", "/")
-    m = re.search(r"(Town[^/]+)/(\d+)\.bin$", path)
+    m = re.search(r"(Town[^/]+(?:/run_\d+)?)/(\d+)\.bin$", path)
     if m:
         return m.group(1), int(m.group(2))
 
@@ -330,7 +389,7 @@ def filter_sweeps(
         scene, frame = sweep_scene_frame(sweep)
         sweep_split = plan.split_for(scene, frame)
 
-        if sweep_split == sample_split:
+        if sweep_split == sample_split and (scene, frame) not in plan.excluded:
             kept.append(sweep)
         else:
             removed.append(
@@ -371,6 +430,11 @@ def rebuild(
         split_name = plan.split_for(scene, frame)
 
         if token in guard_drop:
+            guard_drop_split[split_name] += 1
+            guard_drop_scene[scene] += 1
+            continue
+
+        if (scene, frame) in plan.excluded:
             guard_drop_split[split_name] += 1
             guard_drop_scene[scene] += 1
             continue

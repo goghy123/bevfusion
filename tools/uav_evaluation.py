@@ -20,6 +20,9 @@ GROUPS = {
     "by_frame": "frame_bin",
     "by_town": "town",
     "by_scene": "scene",
+    "by_weather": "weather",
+    "by_motion": "motion_state",
+    "by_disturbance": "disturbance",
     "by_scene_frame": "scene_frame",
 }
 
@@ -101,6 +104,9 @@ def build_gt(dataset, class_index, args, native=False):
                     frame_index=frame,
                     scene=scene,
                     town=town,
+                    weather=info.get("weather", "unknown"),
+                    motion_state=info.get("motion_state", "unknown"),
+                    disturbance=("active" if info.get("attitude_disturbance", {}).get("event_index") is not None else "inactive"),
                     **{"class": str(class_name)},
                     x=x,
                     y=y,

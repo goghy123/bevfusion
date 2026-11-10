@@ -1,0 +1,19 @@
+# Copy and edit using analysis results and CARLA world XY (metres).
+# Empty regions mean a whole-map split, useful as the initial valid plan.
+# To hold out part of a map, add a region, for example:
+# regions:
+#   - {split: val, bounds_xy: [xmin, ymin, xmax, ymax]}
+# Regions require numeric bounds. A buffer strip on both sides is excluded.
+# The same map coordinates apply to ALL weather conditions and run versions.
+version: 1
+settings:
+  guard_keyframes: 2
+spatial_maps:
+  Town01_Opt: {default_split: train, buffer_m: 110.0, regions: []}
+  Town02_Opt: {default_split: train, buffer_m: 110.0, regions: []}
+  Town03_Opt: {default_split: train, buffer_m: 110.0, regions: []}
+  Town04_Opt: {default_split: train, buffer_m: 110.0, regions: []}
+  Town05_Opt: {default_split: val, buffer_m: 110.0, regions: []}
+  Town06_Opt: {default_split: train, buffer_m: 110.0, regions: []}
+  Town07_Opt: {default_split: test, buffer_m: 110.0, regions: []}
+  Town10HD_Opt: {default_split: test, buffer_m: 110.0, regions: []}
