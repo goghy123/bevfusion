@@ -302,47 +302,44 @@ torchpack dist-run -np 1 python tools/train.py \
 
 ## 8. 测试与评估
 
+### 测试
+
+```bash
+RUN=runs/uav-v2-d2-keepfuser-s9-e20
+CFG="$RUN/configs.yaml"
+CKPT="$RUN/epoch_19.pth"
+python tools/test.py "$CFG" "$CKPT" \
+  --out "$RUN/test_results.pkl" \
+  --eval bbox \
+  --json-out-dir "$RUN/test_json_epoch19" \
+  2>&1 | tee "$RUN/test_log.txt"
+```
+
 ### 评估
 
 ```bash
-python tools/test.py \
-  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
-  runs/uavdataset-bevfusion/latest.pth \
-  --out runs/uavdataset-bevfusion/test_results.pkl \
-  --eval bbox \
-  2>&1 | tee runs/uavdataset-bevfusion/test_log.txt
+# 默认 test
+python tools/evaluate.py "$CFG" "$CKPT"
+
+# val
+python tools/evaluate.py "$CFG" "$CKPT" --split val
+
+# train：训练标注 + 验证 pipeline，不使用随机训练增强
+python tools/evaluate.py "$CFG" "$CKPT" --split train
+
+# 强制重新推理覆盖
+python tools/evaluate.py "$CFG" "$CKPT" --split val --force-infer
 ```
 
-可覆盖阈值：
+#### 修改评估阈值
 
 ```bash
-python tools/test.py <config> <checkpoint> --eval bbox \
-  --eval-options iou_threshold=0.7 score_threshold=0.2
-```
-
-### 不同sweep评估
-
-对于`sweeps=6`，先修改对应的config，再执行以下指令：
-
-```bash
-python tools/test.py \
-  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
-  runs/uavdataset-bevfusion-s6/latest.pth \
-  --out runs/uavdataset-bevfusion-s6/test_results.pkl \
-  --eval bbox \
-  2>&1 | tee runs/uavdataset-bevfusion-s6/test_log.txt
-```
-
-对于`sweeps=3、9`的情况，修改对应的config以及指令中的文件后缀即可。
-
-### 保存结果评估
-
-保存测试json结果，用于可视化：
-```BASH
-python tools/test_uav_predictions.py \
-  configs/uavdataset/det/transfusion/secfpn/camera+lidar/swint_v0p1/convfuser.yaml \
-  runs/uavdataset-bevfusion-balanced-s9/latest.pth \
-  --out-dir runs/uavdataset-bevfusion-s9/test_predictions
+python tools/evaluate.py "$CFG" "$CKPT" --split val \
+  --score-threshold 0.05 \
+  --iou-threshold 0.5 \
+  --z-thresholds 0.5 1.0 2.0 \
+  --lower-z -5 --upper-z 5 \
+  --multi-level-span 5 --frame-bin 500
 ```
 
 ## 9.补充
